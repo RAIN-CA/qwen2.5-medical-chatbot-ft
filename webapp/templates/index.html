@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Medical Chatbot Demo</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="page">
+    <aside class="sidebar">
+      <h2>🩺 Medical Chatbot</h2>
+      <p class="muted">Coursework demo for Qwen2.5 medical-domain chatbot fine-tuning</p>
+
+      <label for="modelSelect">Choose model</label>
+      <select id="modelSelect">
+        {% for key, value in model_options.items() %}
+          <option value="{{ key }}" {% if key == "ft_3b" %}selected{% endif %}>
+            {{ value.label }}
+          </option>
+        {% endfor %}
+      </select>
+
+      <div class="notice">
+        <strong>Disclaimer</strong>
+        <p>This system is for academic demonstration only. It does not provide diagnosis or treatment decisions.</p>
+      </div>
+
+      <div class="examples">
+        <h3>Example Questions</h3>
+        <button class="example-btn">What are the common symptoms of diabetes?</button>
+        <button class="example-btn">What is hypertension?</button>
+        <button class="example-btn">What is the difference between CT and MRI?</button>
+        <button class="example-btn">What are common risk factors for heart disease?</button>
+        <button class="example-btn">What is anemia?</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="chat-header">
+        <h1>Medical Chatbot Demo</h1>
+      </div>
+
+      <div id="chatBox" class="chat-box">
+        <div class="message assistant">
+          <div class="bubble">
+            Hello. Ask a medical knowledge question to start the demo.
+          </div>
+        </div>
+      </div>
+
+      <div class="input-area">
+        <textarea id="queryInput" placeholder="Enter your medical question..."></textarea>
+        <div class="actions">
+          <button id="sendBtn">Generate Response</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
