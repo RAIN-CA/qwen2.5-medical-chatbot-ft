@@ -1,0 +1,37 @@
+name: qwen25-medchat
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+  - git
+  - jupyterlab
+  - ipykernel
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - tqdm
+  - pyyaml
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - pip:
+      - transformers>=4.44,<4.58
+      - datasets>=2.19,<3.0
+      - accelerate>=0.33,<1.0
+      - peft>=0.12,<0.18
+      - evaluate>=0.4,<0.5
+      - sentencepiece
+      - protobuf
+      - scipy
+      - bitsandbytes
+      - huggingface_hub
+      - safetensors
+      - einops
+      - jsonlines

@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# Environments
+.conda/
+.env
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data
+data/raw/
+data/processed/
+data/splits/
+
+# Outputs
+outputs/
+reports/generated/
+
+# Hugging Face / cache
+.cache/
+hf_cache/
+huggingface_cache/
+
+# Model files
+*.bin
+*.pt
+*.pth
+*.safetensors
+checkpoints/
+adapters/
+merged_model/
+
+# Eval artifacts
+predictions.json
+metrics.json
