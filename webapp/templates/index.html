@@ -3,58 +3,72 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Medical Chatbot Demo</title>
+  <title>Medical Chatbot Web Demo</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
-<body>
-  <div class="page">
-    <aside class="sidebar">
-      <h2>🩺 Medical Chatbot</h2>
-      <p class="muted">Coursework demo for Qwen2.5 medical-domain chatbot fine-tuning</p>
-
-      <label for="modelSelect">Choose model</label>
-      <select id="modelSelect">
-        {% for key, value in model_options.items() %}
-          <option value="{{ key }}" {% if key == "ft_3b" %}selected{% endif %}>
-            {{ value.label }}
-          </option>
-        {% endfor %}
-      </select>
-
-      <div class="notice">
-        <strong>Disclaimer</strong>
-        <p>This system is for academic demonstration only. It does not provide diagnosis or treatment decisions.</p>
+<body class="page-enter">
+  <div class="app-shell">
+    <aside class="sidebar panel enter-up delay-1">
+      <div class="brand">
+        <div class="brand-icon">🩺</div>
+        <div>
+          <h2>Medical Chatbot</h2>
+          <p>Flask web demo for Qwen2.5 medical-domain chatbot</p>
+        </div>
       </div>
 
-      <div class="examples">
-        <h3>Example Questions</h3>
-        <button class="example-btn">What are the common symptoms of diabetes?</button>
-        <button class="example-btn">What is hypertension?</button>
-        <button class="example-btn">What is the difference between CT and MRI?</button>
-        <button class="example-btn">What are common risk factors for heart disease?</button>
-        <button class="example-btn">What is anemia?</button>
+      <div class="section">
+        <label for="modelSelect">Model</label>
+        <select id="modelSelect">
+          {% for key, value in model_options.items() %}
+            <option value="{{ key }}" {% if key == "ft_3b" %}selected{% endif %}>
+              {{ value.label }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="section">
+        <label>Example Questions</label>
+        <div class="example-list">
+          <button class="example-btn">What are the common symptoms of diabetes?</button>
+          <button class="example-btn">What is hypertension?</button>
+          <button class="example-btn">What is the difference between CT and MRI?</button>
+          <button class="example-btn">What are common risk factors for heart disease?</button>
+          <button class="example-btn">What is anemia?</button>
+        </div>
+      </div>
+
+      <div class="disclaimer">
+        <strong>Academic Use Only</strong>
+        <p>This demo is for coursework only and does not provide diagnosis or treatment advice.</p>
       </div>
     </aside>
 
-    <main class="main">
-      <div class="chat-header">
-        <h1>Medical Chatbot Demo</h1>
-      </div>
+    <main class="main enter-up delay-2">
+      <header class="topbar panel">
+        <div>
+          <h1>Medical Chatbot Web Interface</h1>
+          <p>Custom frontend with Flask backend</p>
+        </div>
+        <button id="clearBtn" class="ghost-btn">Clear Chat</button>
+      </header>
 
-      <div id="chatBox" class="chat-box">
-        <div class="message assistant">
-          <div class="bubble">
+      <section id="chatBox" class="chat-area panel">
+        <div class="message assistant bubble-in">
+          <div class="avatar assistant-avatar">AI</div>
+          <div class="bubble assistant-bubble">
             Hello. Ask a medical knowledge question to start the demo.
           </div>
         </div>
-      </div>
+      </section>
 
-      <div class="input-area">
+      <section class="composer panel enter-up delay-3">
         <textarea id="queryInput" placeholder="Enter your medical question..."></textarea>
-        <div class="actions">
-          <button id="sendBtn">Generate Response</button>
+        <div class="composer-actions">
+          <button id="sendBtn" class="primary-btn">Generate Response</button>
         </div>
-      </div>
+      </section>
     </main>
   </div>
 
