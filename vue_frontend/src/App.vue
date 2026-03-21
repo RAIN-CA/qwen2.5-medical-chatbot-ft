@@ -178,7 +178,7 @@ const loading = ref(false)
 const uploading = ref(false)
 const pendingFile = ref(null)
 
-const query = ref('What are the common symptoms of diabetes?')
+const query = ref('')
 const maxNewTokens = ref(384)
 const temperature = ref(0.2)
 const topP = ref(0.85)
@@ -786,6 +786,7 @@ textarea {
   gap: 10px;
   margin-bottom: 18px;
   align-items: flex-end;
+  will-change: transform, opacity;
 }
 
 .message.user {
@@ -920,15 +921,19 @@ textarea {
 .delay-3 { animation-delay: 0.22s; }
 
 .bubble-enter-active, .bubble-leave-active {
-  transition: all 0.28s ease;
+  transition: opacity 0.38s ease, transform 0.38s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .bubble-enter-from {
   opacity: 0;
-  transform: translateY(8px) scale(0.985);
+  transform: translateY(14px) scale(0.96);
+}
+.bubble-enter-to {
+  opacity: 1;
+  transform: translateY(0) scale(1);
 }
 .bubble-leave-to {
   opacity: 0;
-  transform: translateY(-8px);
+  transform: translateY(-10px) scale(0.98);
 }
 
 .status-enter-active, .status-leave-active {
