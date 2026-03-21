@@ -24,7 +24,7 @@
           <span>Max new tokens</span>
           <span>{{ maxNewTokens }}</span>
         </div>
-        <input v-model="maxNewTokens" type="range" min="128" max="512" step="32" />
+        <input v-model="maxNewTokens" type="range" min="128" max="640" step="32" />
 
         <div class="form-row">
           <span>Temperature</span>
@@ -37,6 +37,39 @@
           <span>{{ topP.toFixed(2) }}</span>
         </div>
         <input v-model="topP" type="range" min="0.5" max="1" step="0.05" />
+      </div>
+
+      <div class="section">
+        <label class="toggle-row">
+          <input type="checkbox" v-model="useRag" />
+          <span>Enable RAG retrieval</span>
+        </label>
+      </div>
+
+      <div class="section">
+        <label>Upload document</label>
+        <input type="file" @change="handleFileChange" />
+        <p class="upload-hint">
+          Supported formats: TXT, MD, PDF, DOCX. Files are normalized into text chunks for retrieval.
+        </p>
+        <button class="primary-btn small-btn" @click="uploadSelectedFile" :disabled="!pendingFile || uploading">
+          {{ uploading ? 'Uploading...' : 'Upload File' }}
+        </button>
+      </div>
+
+      <div class="section">
+        <label>Available documents</label>
+        <div class="file-list">
+          <label v-for="f in uploadedFiles" :key="f.name" class="file-card">
+            <div class="file-left">
+              <input type="checkbox" :value="f.name" v-model="selectedFiles" />
+              <div>
+                <div class="file-name">{{ f.name }}</div>
+                <div class="file-meta">{{ f.type.toUpperCase() }} · {{ f.size_kb }} KB</div>
+              </div>
+            </div>
+          </label>
+        </div>
       </div>
 
       <div class="section">
@@ -61,7 +94,7 @@
       <header class="topbar panel">
         <div>
           <h1>Medical Chatbot Demo</h1>
-          <p>Vue + streaming Python backend</p>
+          <p>Vue + SSE Python backend + optional RAG</p>
         </div>
         <button class="ghost-btn" @click="clearChat" :disabled="loading">Clear Chat</button>
       </header>
@@ -98,10 +131,7 @@
           >
             <div v-if="msg.role === 'assistant'" class="avatar assistant-avatar">AI</div>
 
-            <div
-              class="bubble"
-              :class="msg.role === 'assistant' ? 'assistant-bubble' : 'user-bubble'"
-            >
+            <div class="bubble" :class="msg.role === 'assistant' ? 'assistant-bubble' : 'user-bubble'">
               <span v-html="formatMessage(msg.content)"></span>
               <span
                 v-if="loading && streamingMessageId === msg.id && msg.role === 'assistant'"
@@ -125,7 +155,7 @@
         />
         <div class="actions">
           <button class="primary-btn" @click="sendMessage" :disabled="loading">
-            {{ loading ? 'Generating...' : 'Generate Response' }}
+            {{ loading ? 'Generating response...' : 'Generate Response' }}
           </button>
         </div>
       </section>
@@ -139,11 +169,18 @@ import { ref, onMounted, nextTick } from 'vue'
 const API_BASE = 'http://127.0.0.1:5000'
 
 const models = ref([])
+const uploadedFiles = ref([])
+const selectedFiles = ref([])
 const selectedModel = ref('ft_3b')
+const useRag = ref(false)
+
 const loading = ref(false)
+const uploading = ref(false)
+const pendingFile = ref(null)
+
 const query = ref('What are the common symptoms of diabetes?')
-const maxNewTokens = ref(256)
-const temperature = ref(0.3)
+const maxNewTokens = ref(384)
+const temperature = ref(0.2)
 const topP = ref(0.85)
 
 const chatBoxRef = ref(null)
@@ -170,6 +207,10 @@ const messages = ref([
 
 const statusItems = ref([])
 
+let pendingChunkBuffer = ''
+let flushTimer = null
+let scrollScheduled = false
+
 function escapeHtml(text) {
   return text
     .replace(/&/g, '&amp;')
@@ -182,13 +223,28 @@ function formatMessage(text) {
 }
 
 function scrollToBottom() {
-  nextTick(() => {
-    const el = chatBoxRef.value
-    if (el) el.scrollTop = el.scrollHeight
+  const el = chatBoxRef.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function scheduleScroll() {
+  if (scrollScheduled) return
+  scrollScheduled = true
+  requestAnimationFrame(() => {
+    scrollScheduled = false
+    scrollToBottom()
   })
 }
 
 function addStatus(id, text) {
+  const existing = [...statusItems.value].reverse().find(
+    item => item.id === id && item.state === 'active'
+  )
+  if (existing) {
+    existing.text = text
+    return
+  }
+
   const uid = `${id}-${statusCounter.value++}`
   statusItems.value.push({
     uid,
@@ -222,10 +278,142 @@ function resetStatuses() {
   statusItems.value = []
 }
 
+function startFlushLoop(assistantMsg) {
+  stopFlushLoop()
+
+  flushTimer = setInterval(() => {
+    if (!pendingChunkBuffer) return
+    assistantMsg.content += pendingChunkBuffer
+    pendingChunkBuffer = ''
+    scheduleScroll()
+  }, 50)
+}
+
+function stopFlushLoop() {
+  if (flushTimer) {
+    clearInterval(flushTimer)
+    flushTimer = null
+  }
+}
+
 async function fetchModels() {
   const res = await fetch(`${API_BASE}/api/models`)
   const data = await res.json()
   models.value = data.models
+}
+
+async function fetchFiles() {
+  const res = await fetch(`${API_BASE}/api/files`)
+  const data = await res.json()
+  uploadedFiles.value = data.files || []
+}
+
+function handleFileChange(event) {
+  pendingFile.value = event.target.files?.[0] || null
+}
+
+async function uploadSelectedFile() {
+  if (!pendingFile.value || uploading.value) return
+
+  uploading.value = true
+  try {
+    const formData = new FormData()
+    formData.append('file', pendingFile.value)
+
+    const res = await fetch(`${API_BASE}/api/upload`, {
+      method: 'POST',
+      body: formData,
+    })
+
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || 'Upload failed')
+
+    uploadedFiles.value = data.files || []
+    if (!selectedFiles.value.includes(data.filename)) {
+      selectedFiles.value.push(data.filename)
+    }
+    pendingFile.value = null
+  } catch (err) {
+    alert(`Upload failed: ${err.message}`)
+  } finally {
+    uploading.value = false
+  }
+}
+
+async function startGeneration(payload) {
+  const res = await fetch(`${API_BASE}/api/chat/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+
+  const data = await res.json()
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to start generation')
+  }
+  return data.stream_id
+}
+
+function consumeEventStream(streamId, assistantMsg) {
+  return new Promise((resolve, reject) => {
+    const es = new EventSource(`${API_BASE}/api/chat/events/${streamId}`)
+    let doneReceived = false
+
+    function tryFinish() {
+      if (doneReceived && !pendingChunkBuffer) {
+        stopFlushLoop()
+        es.close()
+        resolve()
+      }
+    }
+
+    es.onmessage = (event) => {
+      let payload
+      try {
+        payload = JSON.parse(event.data)
+      } catch {
+        return
+      }
+
+      const { type, data } = payload
+
+      if (type === 'status') {
+        addStatus(data.id, data.text)
+      } else if (type === 'status_update') {
+        addStatus(data.id, data.text)
+      } else if (type === 'status_done') {
+        completeStatus(data.id, data.text)
+      } else if (type === 'chunk') {
+        pendingChunkBuffer += data.text
+      } else if (type === 'done') {
+        doneReceived = true
+        setTimeout(tryFinish, 60)
+      } else if (type === 'error') {
+        stopFlushLoop()
+        assistantMsg.content = `Error: ${data.message}`
+        es.close()
+        reject(new Error(data.message))
+      }
+    }
+
+    es.onerror = () => {
+      if (doneReceived) {
+        stopFlushLoop()
+        es.close()
+        resolve()
+      }
+    }
+
+    const watcher = setInterval(() => {
+      if (pendingChunkBuffer) {
+        // let the flush loop handle UI updates
+      }
+      if (doneReceived && !pendingChunkBuffer) {
+        clearInterval(watcher)
+        tryFinish()
+      }
+    }, 50)
+  })
 }
 
 async function sendMessage() {
@@ -234,87 +422,43 @@ async function sendMessage() {
 
   loading.value = true
   resetStatuses()
+  pendingChunkBuffer = ''
+  stopFlushLoop()
 
-  const userMsg = {
+  messages.value.push({
     id: messageCounter.value++,
     role: 'user',
     content: text,
-  }
-  messages.value.push(userMsg)
+  })
 
-  const assistantMsg = {
+  messages.value.push({
     id: messageCounter.value++,
     role: 'assistant',
     content: '',
-  }
-  messages.value.push(assistantMsg)
+  })
+  const assistantMsg = messages.value[messages.value.length - 1]
   streamingMessageId.value = assistantMsg.id
+  startFlushLoop(assistantMsg)
 
   query.value = ''
   scrollToBottom()
 
   try {
-    const response = await fetch(`${API_BASE}/api/chat/stream`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model_key: selectedModel.value,
-        query: text,
-        max_new_tokens: Number(maxNewTokens.value),
-        temperature: Number(temperature.value),
-        top_p: Number(topP.value),
-      }),
+    const streamId = await startGeneration({
+      model_key: selectedModel.value,
+      query: text,
+      max_new_tokens: Number(maxNewTokens.value),
+      temperature: Number(temperature.value),
+      top_p: Number(topP.value),
+      use_rag: useRag.value,
+      selected_files: selectedFiles.value,
     })
 
-    if (!response.ok || !response.body) {
-      const errText = await response.text()
-      assistantMsg.content = `Error: ${errText || 'Request failed'}`
-      loading.value = false
-      streamingMessageId.value = null
-      return
-    }
-
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder('utf-8')
-    let buffer = ''
-
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-
-      for (const line of lines) {
-        if (!line.trim()) continue
-
-        let event
-        try {
-          event = JSON.parse(line)
-        } catch {
-          continue
-        }
-
-        const { type, data } = event
-
-        if (type === 'status') {
-          addStatus(data.id, data.text)
-        } else if (type === 'status_done') {
-          completeStatus(data.id, data.text)
-        } else if (type === 'chunk') {
-          assistantMsg.content += data.text
-          scrollToBottom()
-        } else if (type === 'done') {
-          assistantMsg.content = data.text
-        } else if (type === 'error') {
-          assistantMsg.content = `Error: ${data.message}`
-        }
-      }
-    }
+    await consumeEventStream(streamId, assistantMsg)
   } catch (err) {
     assistantMsg.content = `Error: ${err.message || 'Unknown error'}`
   } finally {
+    stopFlushLoop()
     loading.value = false
     streamingMessageId.value = null
     scrollToBottom()
@@ -335,6 +479,7 @@ function clearChat() {
 
 onMounted(async () => {
   await fetchModels()
+  await fetchFiles()
   scrollToBottom()
 })
 </script>
@@ -351,9 +496,7 @@ onMounted(async () => {
   --assistant-border: #e2e8f0;
 }
 
-* {
-  box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
 html, body, #app {
   margin: 0;
@@ -386,7 +529,7 @@ body {
 }
 
 .sidebar {
-  width: 320px;
+  width: 340px;
   border-radius: 24px;
   padding: 24px;
   display: flex;
@@ -411,25 +554,26 @@ body {
   font-size: 22px;
 }
 
-.brand h2 {
-  margin: 0;
-}
-
+.brand h2 { margin: 0; }
 .brand p {
   margin: 6px 0 0 0;
   color: var(--muted);
   font-size: 14px;
 }
 
-.section {
-  margin-bottom: 22px;
-}
+.section { margin-bottom: 22px; }
 
 .section label {
   display: block;
   margin-bottom: 10px;
   font-weight: 700;
   font-size: 14px;
+}
+
+.toggle-row {
+  display: flex !important;
+  align-items: center;
+  gap: 10px;
 }
 
 .form-row {
@@ -440,14 +584,11 @@ body {
   margin: 8px 0 4px;
 }
 
-select,
-textarea,
-input[type="range"] {
+select, textarea, input[type="range"], input[type="file"] {
   width: 100%;
 }
 
-select,
-textarea {
+select, textarea {
   border-radius: 16px;
   border: 1px solid #d8dee9;
   padding: 12px 14px;
@@ -458,6 +599,54 @@ textarea {
 textarea {
   min-height: 110px;
   resize: vertical;
+}
+
+.upload-hint {
+  margin: 8px 0 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.small-btn {
+  margin-top: 10px;
+  width: 100%;
+}
+
+.file-list {
+  max-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 4px;
+}
+
+.file-card {
+  display: block;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(255,255,255,0.82);
+  border: 1px solid rgba(148,163,184,0.18);
+  cursor: pointer;
+}
+
+.file-left {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.file-name {
+  font-size: 14px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.file-meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
 }
 
 .example-btn {
@@ -487,9 +676,7 @@ textarea {
   line-height: 1.55;
 }
 
-.notice p {
-  margin-bottom: 0;
-}
+.notice p { margin-bottom: 0; }
 
 .main {
   flex: 1;
@@ -499,10 +686,7 @@ textarea {
   gap: 16px;
 }
 
-.topbar,
-.status-panel,
-.chat-box,
-.composer {
+.topbar, .status-panel, .chat-box, .composer {
   border-radius: 24px;
 }
 
@@ -513,10 +697,7 @@ textarea {
   align-items: center;
 }
 
-.topbar h1 {
-  margin: 0;
-}
-
+.topbar h1 { margin: 0; }
 .topbar p {
   margin: 6px 0 0 0;
   color: var(--muted);
@@ -690,8 +871,7 @@ textarea {
   justify-content: flex-end;
 }
 
-.primary-btn,
-.ghost-btn {
+.primary-btn, .ghost-btn {
   border: none;
   border-radius: 14px;
   padding: 12px 18px;
@@ -709,13 +889,11 @@ textarea {
   background: white;
 }
 
-.primary-btn:hover,
-.ghost-btn:hover {
+.primary-btn:hover, .ghost-btn:hover {
   transform: translateY(-1px);
 }
 
-.primary-btn:disabled,
-.ghost-btn:disabled {
+.primary-btn:disabled, .ghost-btn:disabled {
   opacity: 0.65;
   cursor: not-allowed;
   transform: none;
@@ -741,31 +919,25 @@ textarea {
 .delay-2 { animation-delay: 0.14s; }
 .delay-3 { animation-delay: 0.22s; }
 
-.bubble-enter-active,
-.bubble-leave-active {
+.bubble-enter-active, .bubble-leave-active {
   transition: all 0.28s ease;
 }
-
 .bubble-enter-from {
   opacity: 0;
   transform: translateY(8px) scale(0.985);
 }
-
 .bubble-leave-to {
   opacity: 0;
   transform: translateY(-8px);
 }
 
-.status-enter-active,
-.status-leave-active {
+.status-enter-active, .status-leave-active {
   transition: all 0.3s ease;
 }
-
 .status-enter-from {
   opacity: 0;
   transform: translateY(8px);
 }
-
 .status-leave-to {
   opacity: 0;
   transform: translateY(-10px);
