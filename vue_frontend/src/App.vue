@@ -35,11 +35,13 @@
       :status-items="statusItems"
       :loading="loading"
       :query="query"
+      :use-rag="useRag"
       :streaming-message-id="streamingMessageId"
       :format-message="formatMessage"
       @clear-chat="clearChat"
       @send-message="sendMessage"
       @update:query="query = $event"
+      @update:useRag="useRag = $event"
     />
   </div>
 </template>
@@ -113,6 +115,17 @@ function addStatus(id, text) {
     return
   }
 
+  if (id.startsWith('rag_')) {
+    statusItems.value.forEach((item) => {
+      if (item.id.startsWith('rag_') && item.id !== id && item.state === 'active') {
+        item.state = 'done'
+        setTimeout(() => {
+          statusItems.value = statusItems.value.filter(x => x.uid !== item.uid)
+        }, 1400)
+      }
+    })
+  }
+
   const uid = `${id}-${statusCounter.value++}`
   statusItems.value.push({
     uid,
@@ -125,12 +138,17 @@ function addStatus(id, text) {
 function completeStatus(id, text) {
   const target = [...statusItems.value].reverse().find(item => item.id === id && item.state === 'active')
   if (!target) {
+    const uid = `${id}-${statusCounter.value++}`
     statusItems.value.push({
-      uid: `${id}-${statusCounter.value++}`,
+      uid,
       id,
       text,
       state: 'done',
     })
+
+    setTimeout(() => {
+      statusItems.value = statusItems.value.filter(item => item.uid !== uid)
+    }, 1400)
     return
   }
 
@@ -139,11 +157,36 @@ function completeStatus(id, text) {
 
   setTimeout(() => {
     statusItems.value = statusItems.value.filter(item => item.uid !== target.uid)
-  }, 900)
+  }, 1400)
 }
 
 function resetStatuses() {
   statusItems.value = []
+}
+
+function completeAllActiveStatusByPrefix(prefix) {
+  statusItems.value.forEach((item) => {
+    if (item.id.startsWith(prefix) && item.state === 'active') {
+      item.state = 'done'
+      setTimeout(() => {
+        statusItems.value = statusItems.value.filter(x => x.uid !== item.uid)
+      }, 1400)
+    }
+  })
+}
+
+function completeActiveStatusById(id, fallbackText = null) {
+  const target = [...statusItems.value].reverse().find(
+    item => item.id === id && item.state === 'active'
+  )
+  if (!target) return
+
+  if (fallbackText) target.text = fallbackText
+  target.state = 'done'
+
+  setTimeout(() => {
+    statusItems.value = statusItems.value.filter(x => x.uid !== target.uid)
+  }, 1400)
 }
 
 async function fetchModels() {
@@ -244,6 +287,9 @@ function consumeEventStream(streamId, assistantMsg) {
       const { type, data } = payload
 
       if (type === 'status') {
+        if (data.id === 'prompt' || data.id === 'generate') {
+          completeAllActiveStatusByPrefix('rag_')
+        }
         addStatus(data.id, data.text)
       } else if (type === 'status_update') {
         addStatus(data.id, data.text)
@@ -252,6 +298,7 @@ function consumeEventStream(streamId, assistantMsg) {
       } else if (type === 'chunk') {
         assistantMsg.content += data.text
       } else if (type === 'done') {
+        completeAllActiveStatusByPrefix('rag_')
         es.close()
         resolve()
       } else if (type === 'error') {
@@ -364,9 +411,12 @@ body {
 
 .app-shell {
   min-height: 100vh;
-  display: flex;
+  height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(320px, 360px) minmax(0, 1fr);
   gap: 20px;
   padding: 20px;
+  overflow: hidden;
 }
 
 .panel {
@@ -407,8 +457,11 @@ body {
   }
 
   .app-shell {
-    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
+    grid-template-columns: 1fr;
     padding: 14px;
+    overflow: visible;
   }
 }
 </style>

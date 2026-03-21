@@ -63,10 +63,23 @@
         @keydown.enter.exact.prevent="$emit('send-message')"
         :disabled="loading"
       />
-      <div class="actions">
-        <button class="primary-btn" @click="$emit('send-message')" :disabled="loading">
-          {{ loading ? 'Generating response...' : 'Generate Response' }}
-        </button>
+
+      <div class="composer-toolbar">
+        <label class="composer-toggle">
+          <input
+            type="checkbox"
+            :checked="useRag"
+            @change="$emit('update:useRag', $event.target.checked)"
+            :disabled="loading"
+          />
+          <span>Use RAG</span>
+        </label>
+
+        <div class="actions">
+          <button class="primary-btn" @click="$emit('send-message')" :disabled="loading">
+            {{ loading ? 'Generating response...' : 'Generate Response' }}
+          </button>
+        </div>
       </div>
     </section>
   </main>
@@ -78,11 +91,12 @@ defineProps({
   statusItems: Array,
   loading: Boolean,
   query: String,
+  useRag: Boolean,
   streamingMessageId: Number,
   formatMessage: Function,
 })
 
-defineEmits(['clear-chat', 'send-message', 'update:query'])
+defineEmits(['clear-chat', 'send-message', 'update:query', 'update:useRag'])
 </script>
 
 <style scoped>

@@ -50,13 +50,6 @@
 
       <div v-if="activeTab === 'rag'" class="tab-panel">
         <div class="section">
-          <label class="toggle-row">
-            <input type="checkbox" :checked="useRag" @change="$emit('update:useRag', $event.target.checked)" />
-            <span>Enable RAG retrieval</span>
-          </label>
-        </div>
-
-        <div class="section">
           <label>RAG Settings</label>
 
           <div class="form-row">
