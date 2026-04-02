@@ -4,22 +4,16 @@ import argparse
 
 from datasets import load_dataset
 from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
     TrainingArguments,
     Trainer,
-    default_data_collator,
+    DataCollatorForSeq2Seq,
     set_seed,
 )
 
 from src.train.config_utils import load_config
-from src.train.formatting import format_example
-from src.train.model_utils import (
-    parse_dtype,
-    load_tokenizer,
-    build_quantization_config,
-    load_base_model,
-    prepare_model_for_training,
-    attach_lora_adapter,
-)
+from src.train_seq2seq.formatting_bart import format_example_seq2seq
 
 
 def main():
@@ -32,7 +26,8 @@ def main():
     model_name = cfg["model_name"]
     train_file = cfg["data"]["train_file"]
     val_file = cfg["data"]["val_file"]
-    max_length = cfg["data"]["max_length"]
+    max_source_length = cfg["data"].get("max_source_length", 512)
+    max_target_length = cfg["data"].get("max_target_length", 128)
 
     output_dir = cfg["training"]["output_dir"]
     num_train_epochs = cfg["training"]["num_train_epochs"]
@@ -51,19 +46,6 @@ def main():
     fp16 = bool(cfg["training"]["fp16"])
     gradient_checkpointing = bool(cfg["training"]["gradient_checkpointing"])
 
-    quant_cfg = cfg.get("quantization", {})
-    load_in_4bit = bool(quant_cfg.get("load_in_4bit", False))
-    bnb_4bit_quant_type = quant_cfg.get("bnb_4bit_quant_type", "nf4")
-    bnb_4bit_use_double_quant = bool(quant_cfg.get("bnb_4bit_use_double_quant", True))
-    bnb_4bit_compute_dtype = parse_dtype(
-        quant_cfg.get("bnb_4bit_compute_dtype", "float16")
-    )
-
-    lora_r = cfg["lora"]["r"]
-    lora_alpha = cfg["lora"]["alpha"]
-    lora_dropout = float(cfg["lora"]["dropout"])
-    target_modules = cfg["lora"]["target_modules"]
-
     seed = cfg["misc"]["seed"]
     report_to = cfg["misc"]["report_to"]
 
@@ -71,7 +53,7 @@ def main():
     random.seed(seed)
 
     print(f"Loading tokenizer: {model_name}")
-    tokenizer = load_tokenizer(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     print("Loading dataset...")
     dataset = load_dataset(
@@ -84,38 +66,22 @@ def main():
     print(dataset)
 
     print(f"Loading model: {model_name}")
-    quantization_config = build_quantization_config(
-        load_in_4bit=load_in_4bit,
-        bnb_4bit_quant_type=bnb_4bit_quant_type,
-        bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
-        bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
-    )
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
-    model = load_base_model(
-        model_name=model_name,
-        fp16=fp16,
-        quantization_config=quantization_config,
-    )
-
-    model = prepare_model_for_training(
-        model=model,
-        load_in_4bit=load_in_4bit,
-        gradient_checkpointing=gradient_checkpointing,
-    )
-
-    model = attach_lora_adapter(
-        model=model,
-        lora_r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        target_modules=target_modules,
-    )
-    model.print_trainable_parameters()
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
 
     print("Tokenizing dataset...")
     tokenized_dataset = dataset.map(
-        lambda x: format_example(x, tokenizer, max_length),
+        lambda x: format_example_seq2seq(x, tokenizer, max_source_length, max_target_length),
         remove_columns=dataset["train"].column_names,
+        load_from_cache_file=False,
+        desc="Tokenizing seq2seq dataset",
+    )
+
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
     )
 
     training_args = TrainingArguments(
@@ -148,13 +114,13 @@ def main():
         train_dataset=tokenized_dataset["train"],
         eval_dataset=tokenized_dataset["validation"],
         processing_class=tokenizer,
-        data_collator=default_data_collator,
+        data_collator=data_collator,
     )
 
     print("Starting training...")
     trainer.train()
 
-    print("Saving final adapter and tokenizer...")
+    print("Saving final model and tokenizer...")
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 

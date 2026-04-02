@@ -1,0 +1,26 @@
+[
+  {
+    "name": "base_0.5b",
+    "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "adapter_path": null,
+    "load_in_4bit": false
+  },
+  {
+    "name": "ft_0.5b",
+    "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "adapter_path": "outputs/qwen25_medchat_smoke",
+    "load_in_4bit": false
+  },
+  {
+    "name": "base_3b",
+    "base_model": "Qwen/Qwen2.5-3B-Instruct",
+    "adapter_path": null,
+    "load_in_4bit": true
+  },
+  {
+    "name": "ft_3b",
+    "base_model": "Qwen/Qwen2.5-3B-Instruct",
+    "adapter_path": "outputs/qwen25_medchat_3b_qlora_smoke",
+    "load_in_4bit": true
+  }
+]

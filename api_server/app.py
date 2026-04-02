@@ -22,8 +22,9 @@ from document_store import (
     get_file_metadata_list,
     delete_file,
     clear_file_cache,
+    reset_document_runtime_cache,
 )
-from rag_service import retrieve_context, clear_chunk_cache
+from rag_service import retrieve_context, clear_chunk_cache, reset_rag_runtime_cache
 
 app = Flask(__name__)
 CORS(app)
@@ -69,6 +70,12 @@ MODEL_CACHE = {}
 
 STREAMS = {}
 STREAM_LOCK = threading.Lock()
+
+def initialize_rag_runtime():
+    reset_document_runtime_cache()
+    reset_rag_runtime_cache()
+
+initialize_rag_runtime()
 
 
 def get_quant_config(load_in_4bit: bool):
@@ -173,16 +180,17 @@ def background_generate(
         rag_hits = []
 
         if use_rag and selected_files:
-            put_event(stream_id, "status", {"id": "rag", "text": "Reading and chunking documents"})
-            time.sleep(0.06)
-            put_event(stream_id, "status_update", {"id": "rag", "text": "Computing similarity scores"})
-
             rag_context, rag_hits = retrieve_context(
                 query=query,
                 selected_files=selected_files,
                 top_k=rag_top_k,
                 chunk_size=rag_chunk_size,
                 overlap=rag_overlap,
+                progress_callback=lambda event_type, step_id, msg: put_event(
+                    stream_id,
+                    event_type,
+                    {"id": step_id, "text": msg},
+                ),
             )
 
             if rag_context:
@@ -367,6 +375,14 @@ def rag_retrieve():
         "context": context,
         "hits": hits,
     })
+
+
+
+@app.post("/api/rag/reset")
+def reset_rag_runtime_endpoint():
+    reset_document_runtime_cache()
+    reset_rag_runtime_cache()
+    return jsonify({"message": "RAG runtime cache reset successfully"})
 
 
 @app.post("/api/chat/start")

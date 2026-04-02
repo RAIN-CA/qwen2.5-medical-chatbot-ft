@@ -1,0 +1,107 @@
+.
+├── README.md
+├── api_server
+│   ├── __init__.py
+│   ├── app.py
+│   ├── document_store.py
+│   ├── rag.py
+│   ├── rag_service.py
+│   └── uploads
+│       ├── Week_9_announcement_-_Group_project_details-1.pdf
+│       └── cfar-pocketguide.pdf
+├── app.py
+├── configs
+│   └── train
+│       ├── full_train.yaml
+│       ├── smoke_test.yaml
+│       └── smoke_test_3b_qlora.yaml
+├── data
+│   ├── processed
+│   │   ├── small_test.jsonl
+│   │   ├── small_train.jsonl
+│   │   ├── small_validation.jsonl
+│   │   ├── summary.json
+│   │   ├── test.jsonl
+│   │   ├── train.jsonl
+│   │   └── validation.jsonl
+│   ├── raw
+│   │   ├── medmcqa
+│   │   ├── medquad
+│   │   └── pubmedqa
+│   └── splits
+├── environment.yml
+├── notebooks
+├── outputs
+│   ├── model_comparison_results.json
+│   ├── qwen25_medchat_3b_qlora_smoke
+│   │   ├── README.md
+│   │   ├── adapter_config.json
+│   │   ├── adapter_model.safetensors
+│   │   ├── chat_template.jinja
+│   │   ├── checkpoint-50
+│   │   ├── checkpoint-63
+│   │   ├── runs
+│   │   ├── tokenizer.json
+│   │   ├── tokenizer_config.json
+│   │   └── training_args.bin
+│   └── qwen25_medchat_smoke
+│       ├── README.md
+│       ├── adapter_config.json
+│       ├── adapter_model.safetensors
+│       ├── added_tokens.json
+│       ├── chat_template.jinja
+│       ├── checkpoint-100
+│       ├── checkpoint-125
+│       ├── merges.txt
+│       ├── special_tokens_map.json
+│       ├── tokenizer.json
+│       ├── tokenizer_config.json
+│       ├── training_args.bin
+│       └── vocab.json
+├── reports
+├── requirements.txt
+├── scripts
+│   ├── download_datasets.py
+│   ├── prepare_medical_chat_data.py
+│   ├── run_smoke_train.sh
+│   ├── run_smoke_train_3b.sh
+│   └── test_smoke_infer.sh
+├── src
+│   ├── __init__.py
+│   ├── data
+│   │   └── __init__.py
+│   ├── eval
+│   │   ├── __init__.py
+│   │   └── compare_models.py
+│   ├── inference
+│   │   ├── __init__.py
+│   │   └── chat_infer.py
+│   ├── train
+│   │   ├── __init__.py
+│   │   └── train_lora.py
+│   └── utils
+│       └── __init__.py
+├── structure.txt
+├── vue_frontend
+│   ├── README.md
+│   ├── index.html
+│   ├── jsconfig.json
+│   ├── package-lock.json
+│   ├── package.json
+│   ├── public
+│   │   └── favicon.ico
+│   ├── src
+│   │   ├── App.vue
+│   │   ├── components
+│   │   └── main.js
+│   └── vite.config.js
+└── webapp
+    ├── README.md
+    ├── app.py
+    ├── static
+    │   ├── app.js
+    │   └── style.css
+    └── templates
+        └── index.html
+
+36 directories, 69 files

@@ -1,54 +1,38 @@
-# Python
+# python
 __pycache__/
-*.py[cod]
-*.so
-*.egg-info/
-build/
-dist/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
 
-# Environments
-.conda/
+# env
 .env
 .venv/
 venv/
+env/
 
-# Jupyter
+# jupyter
 .ipynb_checkpoints/
 
-# VSCode / IDE
-.vscode/
-.idea/
+# node
+node_modules/
+dist/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
+# logs / temp
 *.log
+tmp/
+temp/
 
-# Data
-data/raw/
-data/processed/
-data/splits/
+# data (不上传)
+data/
 
-# Outputs
+# outputs（全部忽略）
 outputs/
-reports/generated/
 
-# Hugging Face / cache
+# 上传文件
+api_server/uploads/
+
+# cache
 .cache/
-hf_cache/
-huggingface_cache/
-
-# Model files
-*.bin
-*.pt
-*.pth
-*.safetensors
-checkpoints/
-adapters/
-merged_model/
-
-# Eval artifacts
-predictions.json
-metrics.json

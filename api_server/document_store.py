@@ -9,6 +9,9 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx"}
 _TEXT_CACHE = {}
 
+def reset_document_runtime_cache():
+    _TEXT_CACHE.clear()
+
 
 def normalize_text(text: str) -> str:
     text = text.replace("\u00a0", " ")
