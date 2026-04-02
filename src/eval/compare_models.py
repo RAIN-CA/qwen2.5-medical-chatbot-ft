@@ -1,12 +1,16 @@
+import argparse
 import json
 from pathlib import Path
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from peft import PeftModel
+from src.inference.engine import (
+    GenerationConfig,
+    load_model_and_tokenizer,
+    generate_answer,
+    unload_model,
+)
 
 
-QUESTIONS = [
+DEFAULT_QUESTIONS = [
     "What are the common symptoms of diabetes?",
     "What is hypertension?",
     "What is the difference between CT and MRI?",
@@ -14,136 +18,132 @@ QUESTIONS = [
     "What is anemia?",
 ]
 
-SYSTEM_PROMPT = (
-    "You are a medical knowledge chatbot for academic coursework. "
-    "Provide clear, concise, educational medical answers. "
-    "Do not provide diagnosis or treatment decisions."
-)
 
-OUTPUT_PATH = Path("outputs/model_comparison_results.json")
+def load_questions(question_file: str | None):
+    if question_file is None:
+        return DEFAULT_QUESTIONS
 
+    path = Path(question_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Question file not found: {path}")
 
-def load_model_and_tokenizer(base_model, adapter_path=None, load_in_4bit=False):
-    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    if path.suffix == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [str(x).strip() for x in data if str(x).strip()]
+        raise ValueError("JSON question file must contain a list of strings.")
 
-    quant_config = None
-    if load_in_4bit:
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.float16,
-        )
+    if path.suffix == ".jsonl":
+        questions = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                q = item.get("question") or item.get("instruction")
+                if q:
+                    questions.append(str(q).strip())
+        return questions
 
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        dtype=torch.float16,
-        trust_remote_code=True,
-        device_map="auto",
-        quantization_config=quant_config,
-    )
-
-    if adapter_path:
-        model = PeftModel.from_pretrained(model, adapter_path)
-
-    model.eval()
-    return tokenizer, model
-
-
-def generate_answer(tokenizer, model, question, max_new_tokens=256):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
-
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=0.7,
-            top_p=0.9,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-    generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
-    response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    return response.strip()
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
 
 def main():
-    models = [
-        {
-            "name": "base_0.5b",
-            "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
-            "adapter_path": None,
-            "load_in_4bit": False,
-        },
-        {
-            "name": "ft_0.5b",
-            "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
-            "adapter_path": "outputs/qwen25_medchat_smoke",
-            "load_in_4bit": False,
-        },
-        {
-            "name": "base_3b",
-            "base_model": "Qwen/Qwen2.5-3B-Instruct",
-            "adapter_path": None,
-            "load_in_4bit": True,
-        },
-        {
-            "name": "ft_3b",
-            "base_model": "Qwen/Qwen2.5-3B-Instruct",
-            "adapter_path": "outputs/qwen25_medchat_3b_qlora_smoke",
-            "load_in_4bit": True,
-        },
-    ]
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model_config",
+        type=str,
+        default="configs/eval/model_compare.json",
+        help="Path to model comparison config JSON.",
+    )
+    parser.add_argument(
+        "--question_file",
+        type=str,
+        default=None,
+        help="Optional file containing evaluation questions.",
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default="outputs/model_comparison_results.json",
+        help="Where to save comparison results.",
+    )
+    parser.add_argument(
+        "--domain",
+        type=str,
+        default="medical",
+        help="Prompt domain: medical/general/...",
+    )
+    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=0.9)
+    args = parser.parse_args()
+
+    config_path = Path(args.model_config)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Model config file not found: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        model_configs = json.load(f)
+
+    questions = load_questions(args.question_file)
+
+    gen_cfg = GenerationConfig(
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        do_sample=True,
+    )
 
     results = []
 
-    for model_cfg in models:
+    for model_cfg in model_configs:
         print(f"\n===== Loading {model_cfg['name']} =====")
+
         tokenizer, model = load_model_and_tokenizer(
             base_model=model_cfg["base_model"],
-            adapter_path=model_cfg["adapter_path"],
-            load_in_4bit=model_cfg["load_in_4bit"],
+            adapter_path=model_cfg.get("adapter_path"),
+            load_in_4bit=bool(model_cfg.get("load_in_4bit", False)),
         )
 
         model_result = {
             "model_name": model_cfg["name"],
             "base_model": model_cfg["base_model"],
-            "adapter_path": model_cfg["adapter_path"],
+            "adapter_path": model_cfg.get("adapter_path"),
+            "load_in_4bit": bool(model_cfg.get("load_in_4bit", False)),
+            "domain": args.domain,
             "answers": [],
         }
 
-        for q in QUESTIONS:
+        for q in questions:
             print(f"Generating for: {q}")
-            ans = generate_answer(tokenizer, model, q)
-            model_result["answers"].append({
-                "question": q,
-                "answer": ans,
-            })
+            ans = generate_answer(
+                tokenizer=tokenizer,
+                model=model,
+                query=q,
+                domain=args.domain,
+                generation_config=gen_cfg,
+            )
+            model_result["answers"].append(
+                {
+                    "question": q,
+                    "answer": ans,
+                }
+            )
 
         results.append(model_result)
+        unload_model(tokenizer, model)
 
-        del model
-        del tokenizer
-        torch.cuda.empty_cache()
+    output_path = Path(args.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    print(f"\nSaved results to: {OUTPUT_PATH}")
+    print(f"\nSaved results to: {output_path}")
 
 
 if __name__ == "__main__":

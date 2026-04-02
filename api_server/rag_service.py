@@ -6,6 +6,9 @@ from document_store import get_normalized_text
 
 _CHUNK_CACHE = {}
 
+def reset_rag_runtime_cache():
+    _CHUNK_CACHE.clear()
+
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> List[str]:
     text = " ".join(text.split())
@@ -54,28 +57,54 @@ def clear_chunk_cache(filename: str = None):
         del _CHUNK_CACHE[k]
 
 
+def _emit(progress_callback, event_type: str, step_id: str, text: str):
+    if progress_callback:
+        progress_callback(event_type, step_id, text)
+
+
 def retrieve_context(
     query: str,
     selected_files: List[str],
     top_k: int = 4,
     chunk_size: int = 800,
     overlap: int = 120,
+    progress_callback=None,
 ) -> Tuple[str, List[Dict]]:
     all_chunks = []
-    for fname in selected_files:
-        all_chunks.extend(build_chunks_for_file(fname, chunk_size=chunk_size, overlap=overlap))
+
+    # Step 1: load
+    _emit(progress_callback, "status", "rag_load", f"Loading {len(selected_files)} selected document(s)")
+    for idx, fname in enumerate(selected_files, start=1):
+        _emit(progress_callback, "status_update", "rag_load", f"Loading file {idx}/{len(selected_files)}: {fname}")
+        _ = get_normalized_text(fname)
+    _emit(progress_callback, "status_done", "rag_load", f"Loaded {len(selected_files)} document(s)")
+
+    # Step 2: chunk
+    _emit(progress_callback, "status", "rag_chunk", "Chunking document text")
+    for idx, fname in enumerate(selected_files, start=1):
+        _emit(progress_callback, "status_update", "rag_chunk", f"Chunking file {idx}/{len(selected_files)}: {fname}")
+        file_chunks = build_chunks_for_file(fname, chunk_size=chunk_size, overlap=overlap)
+        all_chunks.extend(file_chunks)
 
     if not all_chunks:
+        _emit(progress_callback, "status_done", "rag_chunk", "No chunks produced from selected files")
         return "", []
 
+    _emit(progress_callback, "status_done", "rag_chunk", f"Prepared {len(all_chunks)} text chunk(s)")
+
+    # Step 3: vectorize
+    _emit(progress_callback, "status", "rag_vectorize", "Building TF-IDF vectors")
     corpus = [c["text"] for c in all_chunks] + [query]
     vectorizer = TfidfVectorizer(stop_words="english")
     tfidf = vectorizer.fit_transform(corpus)
-
     doc_vectors = tfidf[:-1]
     query_vector = tfidf[-1]
+    _emit(progress_callback, "status_done", "rag_vectorize", f"Built TF-IDF vectors for {len(all_chunks)} chunk(s)")
 
+    # Step 4: rank
+    _emit(progress_callback, "status", "rag_rank", "Computing similarity scores")
     sims = cosine_similarity(query_vector, doc_vectors).flatten()
+    _emit(progress_callback, "status_update", "rag_rank", "Selecting top relevant chunks")
 
     scored = sorted(
         [
@@ -94,7 +123,10 @@ def retrieve_context(
     top_hits = [x for x in scored[:top_k] if x["score"] > 0]
 
     if not top_hits:
+        _emit(progress_callback, "status_done", "rag_rank", "No strongly relevant chunks found")
         return "", []
+
+    _emit(progress_callback, "status_done", "rag_rank", f"Selected top {len(top_hits)} relevant chunk(s)")
 
     context_parts = []
     for idx, hit in enumerate(top_hits, start=1):
