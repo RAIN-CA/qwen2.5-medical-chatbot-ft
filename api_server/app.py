@@ -7,10 +7,12 @@ import time
 import uuid
 import queue
 import threading
+
 import torch
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
     BitsAndBytesConfig,
     TextIteratorStreamer,
 )
@@ -31,49 +33,26 @@ CORS(app)
 
 SYSTEM_PROMPT = (
     "You are a medical knowledge chatbot for academic coursework. "
-    "Provide brief, clear, educational medical answers by default. "
-    "Only give a longer or more detailed answer if the user explicitly asks for more detail. "
+    "Answer briefly and clearly by default. "
+    "Keep most answers within 3 to 6 sentences unless the user explicitly asks for more detail. "
+    "Avoid repetition, avoid multi-turn roleplay, and stop once the answer is complete. "
     "Do not provide diagnosis or treatment decisions. "
     "If retrieved context is provided, use it as supporting reference. "
     "If the retrieved context is insufficient, answer cautiously and say so."
 )
 
-MODEL_OPTIONS = {
-    "base_0_5b": {
-        "label": "Base 0.5B",
-        "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
-        "adapter_path": None,
-        "load_in_4bit": False,
-    },
-    "ft_0_5b": {
-        "label": "Fine-tuned 0.5B",
-        "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
-        "adapter_path": "outputs/qwen25_medchat_smoke",
-        "load_in_4bit": False,
-    },
-    "base_3b": {
-        "label": "Base 3B",
-        "base_model": "Qwen/Qwen2.5-3B-Instruct",
-        "adapter_path": None,
-        "load_in_4bit": True,
-    },
-    "ft_3b": {
-        "label": "Fine-tuned 3B",
-        "base_model": "Qwen/Qwen2.5-3B-Instruct",
-        "adapter_path": "outputs/qwen25_medchat_3b_qlora_smoke",
-        "load_in_4bit": True,
-    },
-}
-
 MAX_UPLOAD_MB = 20
 MODEL_CACHE = {}
+LAST_MODEL_RUNTIME_CONFIG = {}
 
 STREAMS = {}
 STREAM_LOCK = threading.Lock()
 
+
 def initialize_rag_runtime():
     reset_document_runtime_cache()
     reset_rag_runtime_cache()
+
 
 initialize_rag_runtime()
 
@@ -89,12 +68,201 @@ def get_quant_config(load_in_4bit: bool):
     )
 
 
+def infer_model_domain(variant: str):
+    lower = variant.lower()
+    if "balanced_multidomain" in lower:
+        return "multidomain"
+    if "medical" in lower:
+        return "medical"
+    if "finance" in lower:
+        return "finance"
+    if "legal" in lower:
+        return "legal"
+    if "general" in lower:
+        return "general"
+    if "base" in lower:
+        return "all"
+    return "all"
+
+
+def scan_experiment_models():
+    root = "outputs/experiments"
+    if not os.path.exists(root):
+        return {}
+
+    models = {}
+
+    for family in sorted(os.listdir(root)):
+        family_path = os.path.join(root, family)
+        if not os.path.isdir(family_path):
+            continue
+
+        for size in sorted(os.listdir(family_path)):
+            size_path = os.path.join(family_path, size)
+            if not os.path.isdir(size_path):
+                continue
+
+            for variant in sorted(os.listdir(size_path)):
+                variant_path = os.path.join(size_path, variant)
+                adapter_path = os.path.join(variant_path, "adapter")
+
+                if not os.path.isdir(adapter_path):
+                    continue
+
+                key = f"{family}_{size}_{variant}"
+                domain = infer_model_domain(variant)
+
+                if family == "qwen25":
+                    base_model = (
+                        "Qwen/Qwen2.5-3B-Instruct"
+                        if "3b" in size
+                        else "Qwen/Qwen2.5-0.5B-Instruct"
+                    )
+                    model_type = "causal"
+                    load_in_4bit = "3b" in size
+                    prompt_style = "chat"
+                elif family == "bart":
+                    base_model = "facebook/bart-base"
+                    model_type = "seq2seq"
+                    load_in_4bit = False
+                    prompt_style = "plain"
+                elif family == "t5":
+                    base_model = "t5-small"
+                    model_type = "seq2seq"
+                    load_in_4bit = False
+                    prompt_style = "t5"
+                else:
+                    continue
+
+                models[key] = {
+                    "key": key,
+                    "label": f"{family} / {size} / {variant}",
+                    "family": family,
+                    "size": size,
+                    "variant": variant,
+                    "domain": domain,
+                    "base_model": base_model,
+                    "adapter_path": adapter_path,
+                    "load_in_4bit": load_in_4bit,
+                    "model_type": model_type,
+                    "prompt_style": prompt_style,
+                }
+
+    # fallback legacy smoke models if experiments dir is unavailable
+    if not models:
+        models = {
+            "base_0_5b": {
+                "key": "base_0_5b",
+                "label": "Base 0.5B",
+                "family": "qwen25",
+                "size": "0.5b",
+                "variant": "base",
+                "domain": "all",
+                "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "adapter_path": None,
+                "load_in_4bit": False,
+                "model_type": "causal",
+                "prompt_style": "chat",
+            },
+            "ft_0_5b": {
+                "key": "ft_0_5b",
+                "label": "Fine-tuned 0.5B",
+                "family": "qwen25",
+                "size": "0.5b",
+                "variant": "medical_ft",
+                "domain": "medical",
+                "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "adapter_path": "outputs/qwen25_medchat_smoke",
+                "load_in_4bit": False,
+                "model_type": "causal",
+                "prompt_style": "chat",
+            },
+            "base_3b": {
+                "key": "base_3b",
+                "label": "Base 3B",
+                "family": "qwen25",
+                "size": "3b",
+                "variant": "base",
+                "domain": "all",
+                "base_model": "Qwen/Qwen2.5-3B-Instruct",
+                "adapter_path": None,
+                "load_in_4bit": True,
+                "model_type": "causal",
+                "prompt_style": "chat",
+            },
+            "ft_3b": {
+                "key": "ft_3b",
+                "label": "Fine-tuned 3B",
+                "family": "qwen25",
+                "size": "3b",
+                "variant": "medical_ft",
+                "domain": "medical",
+                "base_model": "Qwen/Qwen2.5-3B-Instruct",
+                "adapter_path": "outputs/qwen25_medchat_3b_qlora_smoke",
+                "load_in_4bit": True,
+                "model_type": "causal",
+                "prompt_style": "chat",
+            },
+        }
+
+    return models
+
+
+MODEL_OPTIONS = scan_experiment_models()
+
+
+def build_user_content(query: str, rag_context: str):
+    if not rag_context:
+        return query
+    return (
+        f"User question:\n{query}\n\n"
+        f"Retrieved context:\n{rag_context}\n\n"
+        f"Use the retrieved context if relevant, but avoid unsupported claims."
+    )
+
+
+def build_input_text(tokenizer, cfg, query: str, rag_context: str):
+    prompt_style = cfg.get("prompt_style", "chat")
+    user_content = build_user_content(query, rag_context)
+
+    if prompt_style == "chat":
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    if prompt_style == "t5":
+        return f"question: {user_content}"
+
+    return user_content
+
+
+
+def maybe_reload_model_for_runtime_change(model_key: str, max_new_tokens: int, temperature: float, top_p: float):
+    runtime_sig = {
+        "max_new_tokens": int(max_new_tokens),
+        "temperature": round(float(temperature), 4),
+        "top_p": round(float(top_p), 4),
+    }
+
+    prev_sig = LAST_MODEL_RUNTIME_CONFIG.get(model_key)
+    if prev_sig is not None and prev_sig != runtime_sig:
+        if model_key in MODEL_CACHE:
+            del MODEL_CACHE[model_key]
+
+    LAST_MODEL_RUNTIME_CONFIG[model_key] = runtime_sig
+
+
 def load_model_bundle(model_key: str):
     if model_key in MODEL_CACHE:
         return MODEL_CACHE[model_key], False
 
     cfg = MODEL_OPTIONS[model_key]
-
     tokenizer = AutoTokenizer.from_pretrained(
         cfg["base_model"],
         trust_remote_code=True,
@@ -102,17 +270,24 @@ def load_model_bundle(model_key: str):
 
     quant_config = get_quant_config(cfg["load_in_4bit"])
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        cfg["base_model"],
-        dtype=torch.float16,
-        trust_remote_code=True,
-        device_map="auto",
-        quantization_config=quant_config,
-    )
-
-    model = base_model
-    if cfg["adapter_path"]:
-        model = PeftModel.from_pretrained(base_model, cfg["adapter_path"])
+    if cfg["model_type"] == "causal":
+        base_model = AutoModelForCausalLM.from_pretrained(
+            cfg["base_model"],
+            dtype=torch.float16,
+            trust_remote_code=True,
+            device_map="auto",
+            quantization_config=quant_config,
+        )
+        model = base_model
+        if cfg["adapter_path"]:
+            model = PeftModel.from_pretrained(base_model, cfg["adapter_path"])
+    else:
+        # seq2seq experiments were saved as full fine-tuned models in adapter dir
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            cfg["adapter_path"] or cfg["base_model"],
+            dtype=torch.float16,
+            device_map="auto",
+        )
 
     model.eval()
     MODEL_CACHE[model_key] = (tokenizer, model)
@@ -135,10 +310,7 @@ def put_event(stream_id, event_type, data):
         stream = STREAMS.get(stream_id)
     if not stream:
         return
-    stream["queue"].put({
-        "type": event_type,
-        "data": data,
-    })
+    stream["queue"].put({"type": event_type, "data": data})
 
 
 def mark_done(stream_id):
@@ -152,6 +324,24 @@ def cleanup_stream(stream_id):
     with STREAM_LOCK:
         if stream_id in STREAMS:
             del STREAMS[stream_id]
+
+
+def stream_text_manually(stream_id, text: str):
+    emitted_chars = 0
+    for ch in text:
+        emitted_chars += 1
+        put_event(stream_id, "chunk", {"text": ch})
+
+        if emitted_chars % 40 == 0:
+            put_event(
+                stream_id,
+                "status_update",
+                {"id": "generate", "text": f"Generating response ({emitted_chars} chars)"},
+            )
+
+        time.sleep(0.01)
+
+    return emitted_chars
 
 
 def background_generate(
@@ -170,6 +360,7 @@ def background_generate(
     try:
         put_event(stream_id, "status", {"id": "load", "text": "Checking model cache"})
         (tokenizer, model), loaded_now = load_model_bundle(model_key)
+        cfg = MODEL_OPTIONS[model_key]
         put_event(
             stream_id,
             "status_done",
@@ -210,67 +401,62 @@ def background_generate(
                 )
 
         put_event(stream_id, "status", {"id": "prompt", "text": "Building prompt"})
-
-        user_content = query
-        if rag_context:
-            user_content = (
-                f"User question:\n{query}\n\n"
-                f"Retrieved context:\n{rag_context}\n\n"
-                f"Use the retrieved context if relevant, but avoid unsupported claims."
-            )
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
-
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
+        text = build_input_text(tokenizer, cfg, query, rag_context)
+        inputs = tokenizer(text, return_tensors="pt", truncation=True).to(model.device)
         put_event(stream_id, "status_done", {"id": "prompt", "text": "Prompt ready"})
         put_event(stream_id, "status", {"id": "generate", "text": "Generating response"})
 
-        streamer = TextIteratorStreamer(
-            tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=True,
-        )
-
-        generation_kwargs = dict(
-            **inputs,
-            streamer=streamer,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-        worker = threading.Thread(target=model.generate, kwargs=generation_kwargs)
-        worker.start()
-
         final_text = ""
-        emitted_chars = 0
 
-        for new_text in streamer:
-            for ch in new_text:
-                final_text += ch
-                emitted_chars += 1
-                put_event(stream_id, "chunk", {"text": ch})
+        if cfg["model_type"] == "causal":
+            streamer = TextIteratorStreamer(
+                tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True,
+            )
 
-                if emitted_chars % 40 == 0:
-                    put_event(
-                        stream_id,
-                        "status_update",
-                        {"id": "generate", "text": f"Generating response ({emitted_chars} chars)"},
-                    )
+            generation_kwargs = dict(
+                **inputs,
+                streamer=streamer,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=True,
+                repetition_penalty=1.08,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
 
-                time.sleep(0.012)
+            worker = threading.Thread(target=model.generate, kwargs=generation_kwargs)
+            worker.start()
+
+            emitted_chars = 0
+            for new_text in streamer:
+                for ch in new_text:
+                    final_text += ch
+                    emitted_chars += 1
+                    put_event(stream_id, "chunk", {"text": ch})
+
+                    if emitted_chars % 40 == 0:
+                        put_event(
+                            stream_id,
+                            "status_update",
+                            {"id": "generate", "text": f"Generating response ({emitted_chars} chars)"},
+                        )
+
+                    time.sleep(0.012)
+        else:
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=True,
+                    repetition_penalty=1.05,
+                )
+            final_text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+            emitted_chars = stream_text_manually(stream_id, final_text)
 
         put_event(
             stream_id,
@@ -289,8 +475,16 @@ def background_generate(
 def get_models():
     return jsonify({
         "models": [
-            {"key": k, "label": v["label"]}
-            for k, v in MODEL_OPTIONS.items()
+            {
+                "key": k,
+                "label": v["label"],
+                "family": v["family"],
+                "size": v["size"],
+                "variant": v["variant"],
+                "domain": v["domain"],
+                "model_type": v["model_type"],
+            }
+            for k, v in sorted(MODEL_OPTIONS.items(), key=lambda x: x[1]["label"])
         ]
     })
 
@@ -371,11 +565,7 @@ def rag_retrieve():
         overlap=overlap,
     )
 
-    return jsonify({
-        "context": context,
-        "hits": hits,
-    })
-
+    return jsonify({"context": context, "hits": hits})
 
 
 @app.post("/api/rag/reset")
@@ -388,11 +578,12 @@ def reset_rag_runtime_endpoint():
 @app.post("/api/chat/start")
 def chat_start():
     payload = request.get_json(force=True)
-    model_key = payload.get("model_key", "ft_3b")
+    default_model_key = next(iter(MODEL_OPTIONS.keys()), "")
+    model_key = payload.get("model_key", default_model_key)
     query = payload.get("query", "").strip()
-    max_new_tokens = int(payload.get("max_new_tokens", 384))
-    temperature = float(payload.get("temperature", 0.2))
-    top_p = float(payload.get("top_p", 0.85))
+    max_new_tokens = int(payload.get("max_new_tokens", 160))
+    temperature = float(payload.get("temperature", 0.8))
+    top_p = float(payload.get("top_p", 0.5))
     use_rag = bool(payload.get("use_rag", False))
     selected_files = payload.get("selected_files", []) or []
     rag_top_k = int(payload.get("rag_top_k", 4))
@@ -404,6 +595,13 @@ def chat_start():
 
     if not query:
         return jsonify({"error": "Empty query"}), 400
+
+    maybe_reload_model_for_runtime_change(
+        model_key=model_key,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+    )
 
     stream_id = create_stream()
 
