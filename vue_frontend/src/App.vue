@@ -1,6 +1,7 @@
 <template>
-  <div class="app-shell page-enter">
+  <div class="app-shell">
     <SettingsPanel
+      :open="sidebarOpen"
       :models="models"
       :selected-model="selectedModel"
       :max-new-tokens="maxNewTokens"
@@ -14,7 +15,15 @@
       :selected-files="selectedFiles"
       :pending-file="pendingFile"
       :uploading="uploading"
-      :example-questions="exampleQuestions"
+      :histories="histories"
+      :current-history-id="currentHistoryId"
+      :pending-delete-history="pendingDeleteHistory"
+      @close="sidebarOpen = false"
+      @new-chat="startNewChat"
+      @open-history="openHistory"
+      @delete-history="requestDeleteHistory"
+      @confirm-delete-history="confirmDeleteHistory"
+      @cancel-delete-history="cancelDeleteHistory"
       @update:selectedModel="selectedModel = $event"
       @update:maxNewTokens="maxNewTokens = $event"
       @update:temperature="temperature = $event"
@@ -27,7 +36,6 @@
       @upload-file="uploadSelectedFile"
       @toggle-file="toggleFileSelection"
       @delete-file="deleteUploadedFile"
-      @pick-example="query = $event"
     />
 
     <ChatWindow
@@ -38,8 +46,20 @@
       :use-rag="useRag"
       :streaming-message-id="streamingMessageId"
       :format-message="formatMessage"
+      :selected-domain="selectedDomain"
+      :domain-options="domainOptions"
+      :has-conversation="hasConversation"
+      :selected-model-label="selectedModelLabel"
+      :domain-models="domainModels"
+      :selected-model="selectedModel"
+      @toggle-sidebar="sidebarOpen = !sidebarOpen"
+      @open-settings="sidebarOpen = true"
+      @new-chat="startNewChat"
       @clear-chat="clearChat"
       @send-message="sendMessage"
+      @select-domain="selectDomain"
+      @select-model="selectModel"
+      @select-example="applyExampleQuestion"
       @update:query="query = $event"
       @update:useRag="useRag = $event"
     />
@@ -47,16 +67,28 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import ChatWindow from './components/ChatWindow.vue'
 
 const API_BASE = 'http://127.0.0.1:5000'
+const HISTORY_KEY = 'medchat_vue_histories_v3'
+
+const domainOptions = [
+  { key: 'medical', label: 'Medical', colorClass: 'medical' },
+  { key: 'finance', label: 'Finance', colorClass: 'finance' },
+  { key: 'legal', label: 'Legal', colorClass: 'legal' },
+  { key: 'general', label: 'General', colorClass: 'general' },
+  { key: 'multidomain', label: 'Multi-domain', colorClass: 'multidomain' },
+]
 
 const models = ref([])
 const uploadedFiles = ref([])
 const selectedFiles = ref([])
-const selectedModel = ref('ft_3b')
+
+const sidebarOpen = ref(false)
+const selectedDomain = ref('multidomain')
+const selectedModel = ref('')
 const useRag = ref(false)
 
 const loading = ref(false)
@@ -64,9 +96,9 @@ const uploading = ref(false)
 const pendingFile = ref(null)
 
 const query = ref('')
-const maxNewTokens = ref(384)
-const temperature = ref(0.2)
-const topP = ref(0.85)
+const maxNewTokens = ref(160)
+const temperature = ref(0.8)
+const topP = ref(0.5)
 
 const ragTopK = ref(4)
 const ragChunkSize = ref(800)
@@ -74,26 +106,33 @@ const ragOverlap = ref(120)
 
 const streamingMessageId = ref(null)
 
-const exampleQuestions = [
-  'What are the common symptoms of diabetes?',
-  'What is hypertension?',
-  'What is the difference between CT and MRI?',
-  'What are common risk factors for heart disease?',
-  'What is anemia?',
-]
+const histories = ref([])
+const currentHistoryId = ref(null)
 
 const messageCounter = ref(1)
 const statusCounter = ref(1)
 
-const messages = ref([
-  {
-    id: messageCounter.value++,
-    role: 'assistant',
-    content: 'Hello. Ask a medical knowledge question to start the demo.',
-  },
-])
+const initialAssistantMessage = () => ({
+  id: messageCounter.value++,
+  role: 'assistant',
+  content: 'Hello. Select a domain to begin.',
+})
 
+const messages = ref([initialAssistantMessage()])
 const statusItems = ref([])
+
+const hasConversation = computed(() =>
+  messages.value.some(msg => msg.role === 'user')
+)
+
+const domainModels = computed(() => {
+  return models.value.filter(m => m.domain === selectedDomain.value || m.domain === 'all')
+})
+
+const selectedModelLabel = computed(() => {
+  const item = models.value.find(m => m.key === selectedModel.value)
+  return item?.label || 'No model selected'
+})
 
 function escapeHtml(text) {
   return text
@@ -136,7 +175,10 @@ function addStatus(id, text) {
 }
 
 function completeStatus(id, text) {
-  const target = [...statusItems.value].reverse().find(item => item.id === id && item.state === 'active')
+  const target = [...statusItems.value].reverse().find(
+    item => item.id === id && item.state === 'active'
+  )
+
   if (!target) {
     const uid = `${id}-${statusCounter.value++}`
     statusItems.value.push({
@@ -175,24 +217,52 @@ function completeAllActiveStatusByPrefix(prefix) {
   })
 }
 
-function completeActiveStatusById(id, fallbackText = null) {
-  const target = [...statusItems.value].reverse().find(
-    item => item.id === id && item.state === 'active'
+function choosePreferredModel(domainKey) {
+  const domainCandidates = models.value.filter(
+    m => m.domain === domainKey || m.domain === 'all'
   )
-  if (!target) return
 
-  if (fallbackText) target.text = fallbackText
-  target.state = 'done'
+  const matchers = [
+    m => m.family === 'qwen25' && m.size === '0.5b' && m.domain === domainKey && m.variant.includes('_ft'),
+    m => m.family === 'qwen25' && m.size === '3b' && m.domain === domainKey && m.variant.includes('_ft'),
+    m => m.family === 'qwen25' && m.size === '0.5b' && m.domain === 'multidomain' && m.variant.includes('balanced_multidomain_ft'),
+    m => m.family === 'qwen25' && m.size === '3b' && m.domain === 'multidomain' && m.variant.includes('balanced_multidomain_ft'),
+    m => m.family === 'qwen25' && m.size === '0.5b' && m.domain === 'all',
+    m => m.family === 'qwen25' && m.size === '3b' && m.domain === 'all',
+    m => m.domain === domainKey,
+    m => m.domain === 'all',
+  ]
 
-  setTimeout(() => {
-    statusItems.value = statusItems.value.filter(x => x.uid !== target.uid)
-  }, 1400)
+  for (const matcher of matchers) {
+    const found = domainCandidates.find(matcher)
+    if (found) return found.key
+  }
+
+  return models.value[0]?.key || ''
+}
+
+function selectDomain(domainKey) {
+  selectedDomain.value = domainKey
+  const best = choosePreferredModel(domainKey)
+  if (best) selectedModel.value = best
+}
+
+function selectModel(modelKey) {
+  selectedModel.value = modelKey
+}
+
+function applyExampleQuestion(questionText) {
+  query.value = questionText
 }
 
 async function fetchModels() {
   const res = await fetch(`${API_BASE}/api/models`)
   const data = await res.json()
-  models.value = data.models
+  models.value = data.models || []
+
+  if (!selectedModel.value && models.value.length) {
+    selectedModel.value = choosePreferredModel(selectedDomain.value)
+  }
 }
 
 async function fetchFiles() {
@@ -272,7 +342,15 @@ async function startGeneration(payload) {
   return data.stream_id
 }
 
-function consumeEventStream(streamId, assistantMsg) {
+function updateAssistantMessage(messageId, updater) {
+  const idx = messages.value.findIndex(m => m.id === messageId)
+  if (idx === -1) return
+  const current = messages.value[idx]
+  const next = typeof updater === 'function' ? updater(current) : updater
+  messages.value.splice(idx, 1, next)
+}
+
+function consumeEventStream(streamId, assistantMessageId) {
   return new Promise((resolve, reject) => {
     const es = new EventSource(`${API_BASE}/api/chat/events/${streamId}`)
 
@@ -296,13 +374,19 @@ function consumeEventStream(streamId, assistantMsg) {
       } else if (type === 'status_done') {
         completeStatus(data.id, data.text)
       } else if (type === 'chunk') {
-        assistantMsg.content += data.text
+        updateAssistantMessage(assistantMessageId, (msg) => ({
+          ...msg,
+          content: msg.content + data.text,
+        }))
       } else if (type === 'done') {
         completeAllActiveStatusByPrefix('rag_')
         es.close()
         resolve()
       } else if (type === 'error') {
-        assistantMsg.content = `Error: ${data.message}`
+        updateAssistantMessage(assistantMessageId, (msg) => ({
+          ...msg,
+          content: `Error: ${data.message}`,
+        }))
         es.close()
         reject(new Error(data.message))
       }
@@ -315,66 +399,176 @@ function consumeEventStream(streamId, assistantMsg) {
   })
 }
 
+function buildHistoryTitle() {
+  const firstUser = messages.value.find(m => m.role === 'user')
+  if (!firstUser) return `New ${selectedDomain.value} chat`
+  const text = firstUser.content.trim()
+  return text.length > 42 ? `${text.slice(0, 42)}...` : text
+}
+
+function persistHistories() {
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(histories.value))
+}
+
+function saveCurrentConversation() {
+  if (!messages.value.some(m => m.role === 'user')) return
+
+  const item = {
+    id: currentHistoryId.value || `chat-${Date.now()}`,
+    title: buildHistoryTitle(),
+    domain: selectedDomain.value,
+    modelKey: selectedModel.value,
+    useRag: useRag.value,
+    maxNewTokens: maxNewTokens.value,
+    temperature: temperature.value,
+    topP: topP.value,
+    ragTopK: ragTopK.value,
+    ragChunkSize: ragChunkSize.value,
+    ragOverlap: ragOverlap.value,
+    selectedFiles: [...selectedFiles.value],
+    updatedAt: Date.now(),
+    messages: JSON.parse(JSON.stringify(messages.value)),
+  }
+
+  currentHistoryId.value = item.id
+  const idx = histories.value.findIndex(h => h.id === item.id)
+  if (idx >= 0) {
+    histories.value[idx] = item
+  } else {
+    histories.value.unshift(item)
+  }
+
+  histories.value = [...histories.value].sort((a, b) => b.updatedAt - a.updatedAt)
+  persistHistories()
+}
+
+function loadHistories() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY)
+    histories.value = raw ? JSON.parse(raw) : []
+  } catch {
+    histories.value = []
+  }
+}
+
+function openHistory(item) {
+  currentHistoryId.value = item.id
+  selectedDomain.value = item.domain || 'medical'
+  selectedModel.value = item.modelKey || choosePreferredModel(selectedDomain.value)
+  useRag.value = !!item.useRag
+  maxNewTokens.value = item.maxNewTokens ?? 160
+  temperature.value = item.temperature ?? 0.8
+  topP.value = item.topP ?? 0.5
+  ragTopK.value = item.ragTopK ?? 4
+  ragChunkSize.value = item.ragChunkSize ?? 800
+  ragOverlap.value = item.ragOverlap ?? 120
+  selectedFiles.value = item.selectedFiles || []
+  messages.value = JSON.parse(JSON.stringify(item.messages || [initialAssistantMessage()]))
+  query.value = ''
+  resetStatuses()
+  sidebarOpen.value = false
+}
+
+function clearChat() {
+  messages.value = [initialAssistantMessage()]
+  query.value = ''
+  resetStatuses()
+  streamingMessageId.value = null
+  currentHistoryId.value = null
+}
+
+function startNewChat() {
+  saveCurrentConversation()
+  clearChat()
+  sidebarOpen.value = false
+}
+
+function requestDeleteHistory(item) {
+  pendingDeleteHistory.value = item
+}
+
+function cancelDeleteHistory() {
+  pendingDeleteHistory.value = null
+}
+
+const pendingDeleteHistory = ref(null)
+
+function confirmDeleteHistory() {
+  if (!pendingDeleteHistory.value) return
+  const deleteId = pendingDeleteHistory.value.id
+
+  histories.value = histories.value.filter(h => h.id !== deleteId)
+
+  if (currentHistoryId.value === deleteId) {
+    clearChat()
+  }
+
+  persistHistories()
+  pendingDeleteHistory.value = null
+}
+
 async function sendMessage() {
   const text = query.value.trim()
   if (!text || loading.value) return
 
-  loading.value = true
   resetStatuses()
 
-  messages.value.push({
+  const userMsg = {
     id: messageCounter.value++,
     role: 'user',
     content: text,
-  })
+  }
+  messages.value.push(userMsg)
 
-  messages.value.push({
+  const assistantMsg = {
     id: messageCounter.value++,
     role: 'assistant',
     content: '',
-  })
-  const assistantMsg = messages.value[messages.value.length - 1]
-  streamingMessageId.value = assistantMsg.id
+  }
+  messages.value.push(assistantMsg)
 
   query.value = ''
+  loading.value = true
+  streamingMessageId.value = assistantMsg.id
 
   try {
     const streamId = await startGeneration({
       model_key: selectedModel.value,
       query: text,
-      max_new_tokens: Number(maxNewTokens.value),
-      temperature: Number(temperature.value),
-      top_p: Number(topP.value),
+      max_new_tokens: maxNewTokens.value,
+      temperature: temperature.value,
+      top_p: topP.value,
       use_rag: useRag.value,
       selected_files: selectedFiles.value,
-      rag_top_k: Number(ragTopK.value),
-      rag_chunk_size: Number(ragChunkSize.value),
-      rag_overlap: Number(ragOverlap.value),
+      rag_top_k: ragTopK.value,
+      rag_chunk_size: ragChunkSize.value,
+      rag_overlap: ragOverlap.value,
     })
 
-    await consumeEventStream(streamId, assistantMsg)
+    await consumeEventStream(streamId, assistantMsg.id)
+
+    const finalMsg = messages.value.find(m => m.id === assistantMsg.id)
+    if (!finalMsg?.content.trim()) {
+      updateAssistantMessage(assistantMsg.id, (msg) => ({
+        ...msg,
+        content: 'No response returned.',
+      }))
+    }
+    saveCurrentConversation()
   } catch (err) {
-    assistantMsg.content = `Error: ${err.message || 'Unknown error'}`
+    updateAssistantMessage(assistantMsg.id, (msg) => ({
+      ...msg,
+      content: `Error: ${err.message}`,
+    }))
   } finally {
     loading.value = false
     streamingMessageId.value = null
-    await nextTick()
+    saveCurrentConversation()
   }
 }
 
-function clearChat() {
-  if (loading.value) return
-  messages.value = [
-    {
-      id: messageCounter.value++,
-      role: 'assistant',
-      content: 'Hello. Ask a medical knowledge question to start the demo.',
-    },
-  ]
-  resetStatuses()
-}
-
 onMounted(async () => {
+  loadHistories()
   await fetchModels()
   await fetchFiles()
 })
@@ -382,86 +576,52 @@ onMounted(async () => {
 
 <style>
 :root {
-  --bg: #f4f7fb;
-  --panel: rgba(255, 255, 255, 0.88);
-  --text: #172033;
-  --muted: #667085;
-  --primary: #2563eb;
-  --primary2: #4f46e5;
-  --assistant-bg: #f8fafc;
-  --assistant-border: #e2e8f0;
+  --bg: #0a0b0e;
+  --bg2: #111318;
+  --panel: rgba(20, 23, 30, 0.86);
+  --panel-strong: rgba(18, 21, 28, 0.96);
+  --border: rgba(255,255,255,0.08);
+  --text: #f5f7fb;
+  --muted: #9aa4b2;
+  --primary: #5b7cff;
+  --primary2: #7b5cff;
+  --assistant-bg: #171b23;
+  --assistant-border: rgba(255,255,255,0.08);
+  --shadow: 0 20px 60px rgba(0,0,0,0.38);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--text);
+  background: radial-gradient(circle at top, #171922 0%, #0c0e13 40%, #08090c 100%);
 }
 
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+}
 
 html, body, #app {
   margin: 0;
   min-height: 100%;
-  font-family: Inter, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
 }
 
 body {
-  color: var(--text);
-  background:
-    radial-gradient(circle at top left, #dbeafe, transparent 30%),
-    radial-gradient(circle at bottom right, #e0e7ff, transparent 30%),
-    var(--bg);
   overflow: hidden;
 }
 
-.app-shell {
-  min-height: 100vh;
-  height: 100vh;
-  display: grid;
-  grid-template-columns: minmax(320px, 360px) minmax(0, 1fr);
-  gap: 20px;
-  padding: 20px;
-  overflow: hidden;
+button, input, textarea, select {
+  font: inherit;
 }
 
 .panel {
   background: var(--panel);
-  border: 1px solid rgba(255,255,255,0.72);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-  box-shadow: 0 16px 40px rgba(37, 99, 235, 0.08);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
 }
 
-.page-enter {
-  animation: pageFade 0.55s ease-out both;
-}
-
-.enter-up {
-  opacity: 0;
-  transform: translateY(18px);
-  animation: enterUp 0.6s ease-out forwards;
-}
-
-.delay-1 { animation-delay: 0.05s; }
-.delay-2 { animation-delay: 0.14s; }
-.delay-3 { animation-delay: 0.22s; }
-
-@keyframes pageFade {
-  from { opacity: 0; filter: blur(6px); }
-  to { opacity: 1; filter: blur(0); }
-}
-
-@keyframes enterUp {
-  from { opacity: 0; transform: translateY(18px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-@media (max-width: 1024px) {
-  body {
-    overflow: auto;
-  }
-
-  .app-shell {
-    height: auto;
-    min-height: 100vh;
-    grid-template-columns: 1fr;
-    padding: 14px;
-    overflow: visible;
-  }
+.app-shell {
+  min-height: 100vh;
+  width: 100%;
+  overflow: hidden;
 }
 </style>
