@@ -1,0 +1,1641 @@
+===== FILE: api_server/app.py =====
+from flask import Flask, request, jsonify, Response, stream_with_context
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+import json
+import os
+import time
+import uuid
+import queue
+import threading
+import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    TextIteratorStreamer,
+)
+from peft import PeftModel
+
+from document_store import (
+    UPLOAD_DIR,
+    ALLOWED_EXTENSIONS,
+    get_file_metadata_list,
+    delete_file,
+    clear_file_cache,
+    reset_document_runtime_cache,
+)
+from rag_service import retrieve_context, clear_chunk_cache, reset_rag_runtime_cache
+
+app = Flask(__name__)
+CORS(app)
+
+SYSTEM_PROMPT = (
+    "You are a medical knowledge chatbot for academic coursework. "
+    "Provide brief, clear, educational medical answers by default. "
+    "Only give a longer or more detailed answer if the user explicitly asks for more detail. "
+    "Do not provide diagnosis or treatment decisions. "
+    "If retrieved context is provided, use it as supporting reference. "
+    "If the retrieved context is insufficient, answer cautiously and say so."
+)
+
+MODEL_OPTIONS = {
+    "base_0_5b": {
+        "label": "Base 0.5B",
+        "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "adapter_path": None,
+        "load_in_4bit": False,
+    },
+    "ft_0_5b": {
+        "label": "Fine-tuned 0.5B",
+        "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "adapter_path": "outputs/qwen25_medchat_smoke",
+        "load_in_4bit": False,
+    },
+    "base_3b": {
+        "label": "Base 3B",
+        "base_model": "Qwen/Qwen2.5-3B-Instruct",
+        "adapter_path": None,
+        "load_in_4bit": True,
+    },
+    "ft_3b": {
+        "label": "Fine-tuned 3B",
+        "base_model": "Qwen/Qwen2.5-3B-Instruct",
+        "adapter_path": "outputs/qwen25_medchat_3b_qlora_smoke",
+        "load_in_4bit": True,
+    },
+}
+
+MAX_UPLOAD_MB = 20
+MODEL_CACHE = {}
+
+STREAMS = {}
+STREAM_LOCK = threading.Lock()
+
+def initialize_rag_runtime():
+    reset_document_runtime_cache()
+    reset_rag_runtime_cache()
+
+initialize_rag_runtime()
+
+
+def get_quant_config(load_in_4bit: bool):
+    if not load_in_4bit:
+        return None
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+
+
+def load_model_bundle(model_key: str):
+    if model_key in MODEL_CACHE:
+        return MODEL_CACHE[model_key], False
+
+    cfg = MODEL_OPTIONS[model_key]
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg["base_model"],
+        trust_remote_code=True,
+    )
+
+    quant_config = get_quant_config(cfg["load_in_4bit"])
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        cfg["base_model"],
+        dtype=torch.float16,
+        trust_remote_code=True,
+        device_map="auto",
+        quantization_config=quant_config,
+    )
+
+    model = base_model
+    if cfg["adapter_path"]:
+        model = PeftModel.from_pretrained(base_model, cfg["adapter_path"])
+
+    model.eval()
+    MODEL_CACHE[model_key] = (tokenizer, model)
+    return (tokenizer, model), True
+
+
+def create_stream():
+    stream_id = str(uuid.uuid4())
+    with STREAM_LOCK:
+        STREAMS[stream_id] = {
+            "queue": queue.Queue(),
+            "done": False,
+            "created_at": time.time(),
+        }
+    return stream_id
+
+
+def put_event(stream_id, event_type, data):
+    with STREAM_LOCK:
+        stream = STREAMS.get(stream_id)
+    if not stream:
+        return
+    stream["queue"].put({
+        "type": event_type,
+        "data": data,
+    })
+
+
+def mark_done(stream_id):
+    with STREAM_LOCK:
+        stream = STREAMS.get(stream_id)
+    if stream:
+        stream["done"] = True
+
+
+def cleanup_stream(stream_id):
+    with STREAM_LOCK:
+        if stream_id in STREAMS:
+            del STREAMS[stream_id]
+
+
+def background_generate(
+    stream_id,
+    model_key,
+    query,
+    max_new_tokens,
+    temperature,
+    top_p,
+    use_rag,
+    selected_files,
+    rag_top_k,
+    rag_chunk_size,
+    rag_overlap,
+):
+    try:
+        put_event(stream_id, "status", {"id": "load", "text": "Checking model cache"})
+        (tokenizer, model), loaded_now = load_model_bundle(model_key)
+        put_event(
+            stream_id,
+            "status_done",
+            {"id": "load", "text": "Model ready" if loaded_now else "Model loaded from cache"},
+        )
+
+        rag_context = ""
+        rag_hits = []
+
+        if use_rag and selected_files:
+            rag_context, rag_hits = retrieve_context(
+                query=query,
+                selected_files=selected_files,
+                top_k=rag_top_k,
+                chunk_size=rag_chunk_size,
+                overlap=rag_overlap,
+                progress_callback=lambda event_type, step_id, msg: put_event(
+                    stream_id,
+                    event_type,
+                    {"id": step_id, "text": msg},
+                ),
+            )
+
+            if rag_context:
+                put_event(
+                    stream_id,
+                    "status_done",
+                    {
+                        "id": "rag",
+                        "text": f"Retrieved {len(rag_hits)} relevant chunks from {len(selected_files)} file(s)",
+                    },
+                )
+            else:
+                put_event(
+                    stream_id,
+                    "status_done",
+                    {"id": "rag", "text": "No strongly relevant chunks found"},
+                )
+
+        put_event(stream_id, "status", {"id": "prompt", "text": "Building prompt"})
+
+        user_content = query
+        if rag_context:
+            user_content = (
+                f"User question:\n{query}\n\n"
+                f"Retrieved context:\n{rag_context}\n\n"
+                f"Use the retrieved context if relevant, but avoid unsupported claims."
+            )
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        inputs = tokenizer(text, return_tensors="pt").to(model.device)
+        put_event(stream_id, "status_done", {"id": "prompt", "text": "Prompt ready"})
+        put_event(stream_id, "status", {"id": "generate", "text": "Generating response"})
+
+        streamer = TextIteratorStreamer(
+            tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+
+        generation_kwargs = dict(
+            **inputs,
+            streamer=streamer,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=True,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+        worker = threading.Thread(target=model.generate, kwargs=generation_kwargs)
+        worker.start()
+
+        final_text = ""
+        emitted_chars = 0
+
+        for new_text in streamer:
+
+===== FILE: api_server/document_store.py =====
+from pathlib import Path
+from typing import List, Dict
+from pypdf import PdfReader
+from docx import Document
+
+UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx"}
+_TEXT_CACHE = {}
+
+def reset_document_runtime_cache():
+    _TEXT_CACHE.clear()
+
+
+def normalize_text(text: str) -> str:
+    text = text.replace("\u00a0", " ")
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    return "\n".join(lines)
+
+
+def list_uploaded_files() -> List[str]:
+    files = []
+    for p in sorted(UPLOAD_DIR.iterdir()):
+        if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS:
+            files.append(p.name)
+    return files
+
+
+def get_file_metadata_list() -> List[Dict]:
+    items = []
+    for name in list_uploaded_files():
+        path = UPLOAD_DIR / name
+        items.append({
+            "name": name,
+            "size_kb": round(path.stat().st_size / 1024, 1),
+            "type": path.suffix.lower().replace(".", ""),
+        })
+    return items
+
+
+def extract_text_from_file(path: Path) -> str:
+    suffix = path.suffix.lower()
+
+    if suffix in {".txt", ".md"}:
+        return normalize_text(path.read_text(encoding="utf-8", errors="ignore"))
+
+    if suffix == ".pdf":
+        reader = PdfReader(str(path))
+        texts = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                texts.append("")
+        return normalize_text("\n".join(texts))
+
+    if suffix == ".docx":
+        doc = Document(str(path))
+        return normalize_text("\n".join([p.text for p in doc.paragraphs]))
+
+    return ""
+
+
+def get_normalized_text(filename: str) -> str:
+    path = UPLOAD_DIR / filename
+    if not path.exists():
+        return ""
+
+    stat = path.stat()
+    cache_key = (str(path), stat.st_mtime, stat.st_size, "text")
+
+    if cache_key in _TEXT_CACHE:
+        return _TEXT_CACHE[cache_key]
+
+    text = extract_text_from_file(path)
+    _TEXT_CACHE[cache_key] = text
+    return text
+
+
+def clear_file_cache(filename: str):
+    keys_to_delete = []
+    for k in _TEXT_CACHE.keys():
+        if str(UPLOAD_DIR / filename) in str(k):
+            keys_to_delete.append(k)
+    for k in keys_to_delete:
+        del _TEXT_CACHE[k]
+
+
+def delete_file(filename: str) -> bool:
+    path = UPLOAD_DIR / filename
+    if not path.exists():
+        return False
+    path.unlink()
+    clear_file_cache(filename)
+    return True
+
+===== FILE: api_server/rag.py =====
+from pathlib import Path
+from typing import List, Dict, Tuple
+from pypdf import PdfReader
+from docx import Document
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+_TEXT_CACHE = {}
+
+
+def normalize_text(text: str) -> str:
+    text = text.replace("\u00a0", " ")
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    return "\n".join(lines)
+
+
+def list_uploaded_files() -> List[str]:
+    files = []
+    for p in sorted(UPLOAD_DIR.iterdir()):
+        if p.is_file() and p.suffix.lower() in {".txt", ".md", ".pdf", ".docx"}:
+            files.append(p.name)
+    return files
+
+
+def get_file_metadata_list() -> List[Dict]:
+    items = []
+    for name in list_uploaded_files():
+        path = UPLOAD_DIR / name
+        items.append({
+            "name": name,
+            "size_kb": round(path.stat().st_size / 1024, 1),
+            "type": path.suffix.lower().replace(".", ""),
+        })
+    return items
+
+
+def extract_text_from_file(path: Path) -> str:
+    suffix = path.suffix.lower()
+
+    if suffix in {".txt", ".md"}:
+        return normalize_text(path.read_text(encoding="utf-8", errors="ignore"))
+
+    if suffix == ".pdf":
+        reader = PdfReader(str(path))
+        texts = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                texts.append("")
+        return normalize_text("\n".join(texts))
+
+    if suffix == ".docx":
+        doc = Document(str(path))
+        return normalize_text("\n".join([p.text for p in doc.paragraphs]))
+
+    return ""
+
+
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> List[str]:
+    text = " ".join(text.split())
+    if not text:
+        return []
+
+    chunks = []
+    start = 0
+    n = len(text)
+
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end == n:
+            break
+        start = max(end - overlap, start + 1)
+
+    return chunks
+
+
+def load_chunks_for_file(filename: str) -> List[Dict]:
+    path = UPLOAD_DIR / filename
+    if not path.exists():
+        return []
+
+    stat = path.stat()
+    cache_key = (str(path), stat.st_mtime, stat.st_size)
+
+    if cache_key in _TEXT_CACHE:
+        return _TEXT_CACHE[cache_key]
+
+    text = extract_text_from_file(path)
+    chunks = chunk_text(text)
+
+    records = [{"filename": filename, "chunk_id": i, "text": c} for i, c in enumerate(chunks)]
+    _TEXT_CACHE.clear()
+    _TEXT_CACHE[cache_key] = records
+    return records
+
+
+def retrieve_context(query: str, selected_files: List[str], top_k: int = 4) -> Tuple[str, List[Dict]]:
+    all_chunks = []
+    for fname in selected_files:
+        all_chunks.extend(load_chunks_for_file(fname))
+
+    if not all_chunks:
+        return "", []
+
+    corpus = [c["text"] for c in all_chunks] + [query]
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf = vectorizer.fit_transform(corpus)
+
+    doc_vectors = tfidf[:-1]
+    query_vector = tfidf[-1]
+
+    sims = cosine_similarity(query_vector, doc_vectors).flatten()
+    scored = sorted(
+        [
+            {
+                "filename": all_chunks[i]["filename"],
+                "chunk_id": all_chunks[i]["chunk_id"],
+                "text": all_chunks[i]["text"],
+                "score": float(sims[i]),
+            }
+            for i in range(len(all_chunks))
+        ],
+        key=lambda x: x["score"],
+        reverse=True,
+    )
+
+    top_hits = [x for x in scored[:top_k] if x["score"] > 0]
+
+    if not top_hits:
+        return "", []
+
+    context_parts = []
+    for idx, hit in enumerate(top_hits, start=1):
+        context_parts.append(
+            f"[Document {idx} | file={hit['filename']} | chunk={hit['chunk_id']} | score={hit['score']:.4f}]\n{hit['text']}"
+        )
+
+    context = "\n\n".join(context_parts)
+    return context, top_hits
+
+===== FILE: api_server/rag_service.py =====
+from typing import List, Dict, Tuple
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+from document_store import get_normalized_text
+
+_CHUNK_CACHE = {}
+
+def reset_rag_runtime_cache():
+    _CHUNK_CACHE.clear()
+
+
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> List[str]:
+    text = " ".join(text.split())
+    if not text:
+        return []
+
+    chunks = []
+    start = 0
+    n = len(text)
+
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end == n:
+            break
+        start = max(end - overlap, start + 1)
+
+    return chunks
+
+
+def build_chunks_for_file(filename: str, chunk_size: int = 800, overlap: int = 120) -> List[Dict]:
+    cache_key = (filename, chunk_size, overlap)
+    if cache_key in _CHUNK_CACHE:
+        return _CHUNK_CACHE[cache_key]
+
+    text = get_normalized_text(filename)
+    chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+    records = [{"filename": filename, "chunk_id": i, "text": c} for i, c in enumerate(chunks)]
+
+    _CHUNK_CACHE[cache_key] = records
+    return records
+
+
+def clear_chunk_cache(filename: str = None):
+    if filename is None:
+        _CHUNK_CACHE.clear()
+        return
+
+    keys_to_delete = []
+    for k in _CHUNK_CACHE.keys():
+        if k[0] == filename:
+            keys_to_delete.append(k)
+    for k in keys_to_delete:
+        del _CHUNK_CACHE[k]
+
+
+def _emit(progress_callback, event_type: str, step_id: str, text: str):
+    if progress_callback:
+        progress_callback(event_type, step_id, text)
+
+
+def retrieve_context(
+    query: str,
+    selected_files: List[str],
+    top_k: int = 4,
+    chunk_size: int = 800,
+    overlap: int = 120,
+    progress_callback=None,
+) -> Tuple[str, List[Dict]]:
+    all_chunks = []
+
+    # Step 1: load
+    _emit(progress_callback, "status", "rag_load", f"Loading {len(selected_files)} selected document(s)")
+    for idx, fname in enumerate(selected_files, start=1):
+        _emit(progress_callback, "status_update", "rag_load", f"Loading file {idx}/{len(selected_files)}: {fname}")
+        _ = get_normalized_text(fname)
+    _emit(progress_callback, "status_done", "rag_load", f"Loaded {len(selected_files)} document(s)")
+
+    # Step 2: chunk
+    _emit(progress_callback, "status", "rag_chunk", "Chunking document text")
+    for idx, fname in enumerate(selected_files, start=1):
+        _emit(progress_callback, "status_update", "rag_chunk", f"Chunking file {idx}/{len(selected_files)}: {fname}")
+        file_chunks = build_chunks_for_file(fname, chunk_size=chunk_size, overlap=overlap)
+        all_chunks.extend(file_chunks)
+
+    if not all_chunks:
+        _emit(progress_callback, "status_done", "rag_chunk", "No chunks produced from selected files")
+        return "", []
+
+    _emit(progress_callback, "status_done", "rag_chunk", f"Prepared {len(all_chunks)} text chunk(s)")
+
+    # Step 3: vectorize
+    _emit(progress_callback, "status", "rag_vectorize", "Building TF-IDF vectors")
+    corpus = [c["text"] for c in all_chunks] + [query]
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf = vectorizer.fit_transform(corpus)
+    doc_vectors = tfidf[:-1]
+    query_vector = tfidf[-1]
+    _emit(progress_callback, "status_done", "rag_vectorize", f"Built TF-IDF vectors for {len(all_chunks)} chunk(s)")
+
+    # Step 4: rank
+    _emit(progress_callback, "status", "rag_rank", "Computing similarity scores")
+    sims = cosine_similarity(query_vector, doc_vectors).flatten()
+    _emit(progress_callback, "status_update", "rag_rank", "Selecting top relevant chunks")
+
+    scored = sorted(
+        [
+            {
+                "filename": all_chunks[i]["filename"],
+                "chunk_id": all_chunks[i]["chunk_id"],
+                "text": all_chunks[i]["text"],
+                "score": float(sims[i]),
+            }
+            for i in range(len(all_chunks))
+        ],
+        key=lambda x: x["score"],
+        reverse=True,
+    )
+
+    top_hits = [x for x in scored[:top_k] if x["score"] > 0]
+
+    if not top_hits:
+        _emit(progress_callback, "status_done", "rag_rank", "No strongly relevant chunks found")
+        return "", []
+
+    _emit(progress_callback, "status_done", "rag_rank", f"Selected top {len(top_hits)} relevant chunk(s)")
+
+    context_parts = []
+    for idx, hit in enumerate(top_hits, start=1):
+        context_parts.append(
+            f"[Document {idx} | file={hit['filename']} | chunk={hit['chunk_id']} | score={hit['score']:.4f}]\n{hit['text']}"
+        )
+
+    context = "\n\n".join(context_parts)
+    return context, top_hits
+
+===== FILE: vue_frontend/src/App.vue =====
+<template>
+  <div class="app-shell page-enter">
+    <SettingsPanel
+      :models="models"
+      :selected-model="selectedModel"
+      :max-new-tokens="maxNewTokens"
+      :temperature="temperature"
+      :top-p="topP"
+      :use-rag="useRag"
+      :rag-top-k="ragTopK"
+      :rag-chunk-size="ragChunkSize"
+      :rag-overlap="ragOverlap"
+      :uploaded-files="uploadedFiles"
+      :selected-files="selectedFiles"
+      :pending-file="pendingFile"
+      :uploading="uploading"
+      :example-questions="exampleQuestions"
+      @update:selectedModel="selectedModel = $event"
+      @update:maxNewTokens="maxNewTokens = $event"
+      @update:temperature="temperature = $event"
+      @update:topP="topP = $event"
+      @update:useRag="useRag = $event"
+      @update:ragTopK="ragTopK = $event"
+      @update:ragChunkSize="ragChunkSize = $event"
+      @update:ragOverlap="ragOverlap = $event"
+      @file-change="handleFileChange"
+      @upload-file="uploadSelectedFile"
+      @toggle-file="toggleFileSelection"
+      @delete-file="deleteUploadedFile"
+      @pick-example="query = $event"
+    />
+
+    <ChatWindow
+      :messages="messages"
+      :status-items="statusItems"
+      :loading="loading"
+      :query="query"
+      :use-rag="useRag"
+      :streaming-message-id="streamingMessageId"
+      :format-message="formatMessage"
+      @clear-chat="clearChat"
+      @send-message="sendMessage"
+      @update:query="query = $event"
+      @update:useRag="useRag = $event"
+    />
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, nextTick } from 'vue'
+import SettingsPanel from './components/SettingsPanel.vue'
+import ChatWindow from './components/ChatWindow.vue'
+
+const API_BASE = 'http://127.0.0.1:5000'
+
+const models = ref([])
+const uploadedFiles = ref([])
+const selectedFiles = ref([])
+const selectedModel = ref('ft_3b')
+const useRag = ref(false)
+
+const loading = ref(false)
+const uploading = ref(false)
+const pendingFile = ref(null)
+
+const query = ref('')
+const maxNewTokens = ref(384)
+const temperature = ref(0.2)
+const topP = ref(0.85)
+
+const ragTopK = ref(4)
+const ragChunkSize = ref(800)
+const ragOverlap = ref(120)
+
+const streamingMessageId = ref(null)
+
+const exampleQuestions = [
+  'What are the common symptoms of diabetes?',
+  'What is hypertension?',
+  'What is the difference between CT and MRI?',
+  'What are common risk factors for heart disease?',
+  'What is anemia?',
+]
+
+const messageCounter = ref(1)
+const statusCounter = ref(1)
+
+const messages = ref([
+  {
+    id: messageCounter.value++,
+    role: 'assistant',
+    content: 'Hello. Ask a medical knowledge question to start the demo.',
+  },
+])
+
+const statusItems = ref([])
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function formatMessage(text) {
+  return escapeHtml(text).replace(/\n/g, '<br>')
+}
+
+function addStatus(id, text) {
+  const existing = [...statusItems.value].reverse().find(
+    item => item.id === id && item.state === 'active'
+  )
+  if (existing) {
+    existing.text = text
+    return
+  }
+
+  if (id.startsWith('rag_')) {
+    statusItems.value.forEach((item) => {
+      if (item.id.startsWith('rag_') && item.id !== id && item.state === 'active') {
+        item.state = 'done'
+        setTimeout(() => {
+          statusItems.value = statusItems.value.filter(x => x.uid !== item.uid)
+        }, 1400)
+      }
+    })
+  }
+
+  const uid = `${id}-${statusCounter.value++}`
+  statusItems.value.push({
+    uid,
+    id,
+    text,
+    state: 'active',
+  })
+}
+
+function completeStatus(id, text) {
+  const target = [...statusItems.value].reverse().find(item => item.id === id && item.state === 'active')
+  if (!target) {
+    const uid = `${id}-${statusCounter.value++}`
+    statusItems.value.push({
+      uid,
+      id,
+      text,
+      state: 'done',
+    })
+
+    setTimeout(() => {
+      statusItems.value = statusItems.value.filter(item => item.uid !== uid)
+    }, 1400)
+    return
+  }
+
+  target.text = text
+  target.state = 'done'
+
+  setTimeout(() => {
+    statusItems.value = statusItems.value.filter(item => item.uid !== target.uid)
+  }, 1400)
+}
+
+function resetStatuses() {
+  statusItems.value = []
+}
+
+function completeAllActiveStatusByPrefix(prefix) {
+  statusItems.value.forEach((item) => {
+    if (item.id.startsWith(prefix) && item.state === 'active') {
+      item.state = 'done'
+      setTimeout(() => {
+        statusItems.value = statusItems.value.filter(x => x.uid !== item.uid)
+      }, 1400)
+    }
+  })
+}
+
+function completeActiveStatusById(id, fallbackText = null) {
+  const target = [...statusItems.value].reverse().find(
+    item => item.id === id && item.state === 'active'
+  )
+  if (!target) return
+
+  if (fallbackText) target.text = fallbackText
+  target.state = 'done'
+
+  setTimeout(() => {
+    statusItems.value = statusItems.value.filter(x => x.uid !== target.uid)
+  }, 1400)
+}
+
+async function fetchModels() {
+  const res = await fetch(`${API_BASE}/api/models`)
+  const data = await res.json()
+  models.value = data.models
+}
+
+async function fetchFiles() {
+  const res = await fetch(`${API_BASE}/api/rag/files`)
+  const data = await res.json()
+  uploadedFiles.value = data.files || []
+}
+
+function handleFileChange(event) {
+  pendingFile.value = event.target.files?.[0] || null
+}
+
+async function uploadSelectedFile() {
+  if (!pendingFile.value || uploading.value) return
+
+  uploading.value = true
+  try {
+    const formData = new FormData()
+    formData.append('file', pendingFile.value)
+
+    const res = await fetch(`${API_BASE}/api/rag/files/upload`, {
+      method: 'POST',
+      body: formData,
+    })
+
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || 'Upload failed')
+
+    uploadedFiles.value = data.files || []
+    if (!selectedFiles.value.includes(data.filename)) {
+      selectedFiles.value.push(data.filename)
+    }
+    pendingFile.value = null
+  } catch (err) {
+    alert(`Upload failed: ${err.message}`)
+  } finally {
+    uploading.value = false
+  }
+}
+
+function toggleFileSelection(filename) {
+  if (selectedFiles.value.includes(filename)) {
+    selectedFiles.value = selectedFiles.value.filter(f => f !== filename)
+  } else {
+    selectedFiles.value.push(filename)
+  }
+}
+
+async function deleteUploadedFile(filename) {
+  if (!confirm(`Delete file "${filename}"?`)) return
+
+  try {
+    const res = await fetch(`${API_BASE}/api/rag/files/${encodeURIComponent(filename)}`, {
+      method: 'DELETE',
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || 'Delete failed')
+
+    uploadedFiles.value = data.files || []
+    selectedFiles.value = selectedFiles.value.filter(f => f !== filename)
+  } catch (err) {
+    alert(`Delete failed: ${err.message}`)
+  }
+}
+
+async function startGeneration(payload) {
+  const res = await fetch(`${API_BASE}/api/chat/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+
+  const data = await res.json()
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to start generation')
+  }
+  return data.stream_id
+}
+
+function consumeEventStream(streamId, assistantMsg) {
+  return new Promise((resolve, reject) => {
+    const es = new EventSource(`${API_BASE}/api/chat/events/${streamId}`)
+
+    es.onmessage = (event) => {
+      let payload
+      try {
+        payload = JSON.parse(event.data)
+      } catch {
+        return
+      }
+
+      const { type, data } = payload
+
+      if (type === 'status') {
+        if (data.id === 'prompt' || data.id === 'generate') {
+          completeAllActiveStatusByPrefix('rag_')
+        }
+        addStatus(data.id, data.text)
+      } else if (type === 'status_update') {
+        addStatus(data.id, data.text)
+      } else if (type === 'status_done') {
+        completeStatus(data.id, data.text)
+      } else if (type === 'chunk') {
+        assistantMsg.content += data.text
+      } else if (type === 'done') {
+        completeAllActiveStatusByPrefix('rag_')
+        es.close()
+        resolve()
+      } else if (type === 'error') {
+        assistantMsg.content = `Error: ${data.message}`
+        es.close()
+        reject(new Error(data.message))
+      }
+    }
+
+    es.onerror = () => {
+      es.close()
+      resolve()
+    }
+  })
+}
+
+async function sendMessage() {
+  const text = query.value.trim()
+  if (!text || loading.value) return
+
+===== FILE: vue_frontend/src/components/ChatWindow.vue =====
+<template>
+  <main class="main enter-up delay-2">
+    <header class="topbar panel">
+      <div>
+        <h1>Medical Chatbot Demo</h1>
+        <p>Vue + SSE Python backend + optional RAG</p>
+      </div>
+      <button class="ghost-btn" @click="$emit('clear-chat')" :disabled="loading">Clear Chat</button>
+    </header>
+
+    <section class="status-panel panel enter-up delay-3" v-if="loading || statusItems.length">
+      <div class="status-header">
+        <span class="thinking-dot"></span>
+        <span>{{ loading ? 'System status' : 'Recent progress' }}</span>
+      </div>
+
+      <transition-group name="status" tag="div" class="status-list">
+        <div
+          v-for="item in statusItems"
+          :key="item.uid"
+          class="status-item"
+          :class="item.state"
+        >
+          <span class="status-icon">
+            <span v-if="item.state === 'active'" class="spinner-mini"></span>
+            <span v-else>✓</span>
+          </span>
+          <span>{{ item.text }}</span>
+        </div>
+      </transition-group>
+    </section>
+
+    <section ref="chatBoxRef" class="chat-box panel">
+      <transition-group name="bubble" tag="div">
+        <div
+          v-for="msg in messages"
+          :key="msg.id"
+          class="message"
+          :class="msg.role"
+        >
+          <div v-if="msg.role === 'assistant'" class="avatar assistant-avatar">AI</div>
+
+          <div class="bubble" :class="msg.role === 'assistant' ? 'assistant-bubble' : 'user-bubble'">
+            <span v-html="formatMessage(msg.content)"></span>
+            <span
+              v-if="loading && streamingMessageId === msg.id && msg.role === 'assistant'"
+              class="typing-cursor"
+            >
+              ▌
+            </span>
+          </div>
+
+          <div v-if="msg.role === 'user'" class="avatar user-avatar">You</div>
+        </div>
+      </transition-group>
+    </section>
+
+    <section class="composer panel enter-up delay-3">
+      <textarea
+        :value="query"
+        @input="$emit('update:query', $event.target.value)"
+        placeholder="Enter your medical question..."
+        @keydown.enter.exact.prevent="$emit('send-message')"
+        :disabled="loading"
+      />
+
+      <div class="composer-toolbar">
+        <label class="composer-toggle">
+          <input
+            type="checkbox"
+            :checked="useRag"
+            @change="$emit('update:useRag', $event.target.checked)"
+            :disabled="loading"
+          />
+          <span>Use RAG</span>
+        </label>
+
+        <div class="actions">
+          <button class="primary-btn" @click="$emit('send-message')" :disabled="loading">
+            {{ loading ? 'Generating response...' : 'Generate Response' }}
+          </button>
+        </div>
+      </div>
+    </section>
+  </main>
+</template>
+
+<script setup>
+defineProps({
+  messages: Array,
+  statusItems: Array,
+  loading: Boolean,
+  query: String,
+  useRag: Boolean,
+  streamingMessageId: Number,
+  formatMessage: Function,
+})
+
+defineEmits(['clear-chat', 'send-message', 'update:query', 'update:useRag'])
+</script>
+
+<style scoped>
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.topbar, .status-panel, .chat-box, .composer {
+  border-radius: 24px;
+}
+
+.topbar {
+  padding: 20px 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.topbar h1 { margin: 0; }
+.topbar p {
+  margin: 6px 0 0 0;
+  color: var(--muted);
+}
+
+.status-panel {
+  padding: 14px 18px;
+}
+
+.status-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+
+.thinking-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--primary), var(--primary2));
+  animation: pulse 1.1s infinite;
+}
+
+.status-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.status-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  font-size: 14px;
+}
+
+.status-item.active {
+  background: rgba(219, 234, 254, 0.55);
+  color: #1d4ed8;
+}
+
+.status-item.done {
+  background: rgba(236, 253, 245, 0.75);
+  color: #047857;
+}
+
+.status-icon {
+  width: 18px;
+  display: flex;
+  justify-content: center;
+}
+
+.spinner-mini {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid rgba(37, 99, 235, 0.18);
+  border-top-color: var(--primary);
+  animation: spin 0.9s linear infinite;
+}
+
+.chat-box {
+  flex: 1;
+  min-height: 480px;
+  max-height: calc(100vh - 320px);
+  overflow-y: auto;
+  padding: 24px;
+  scroll-behavior: smooth;
+}
+
+.chat-box::-webkit-scrollbar {
+  width: 10px;
+}
+
+.chat-box::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+}
+
+.message {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 18px;
+  align-items: flex-end;
+  will-change: transform, opacity;
+}
+
+.message.user {
+  justify-content: flex-end;
+}
+
+.avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.assistant-avatar {
+  background: linear-gradient(135deg, #dbeafe, #e0e7ff);
+  color: #1d4ed8;
+}
+
+.user-avatar {
+  background: linear-gradient(135deg, var(--primary), var(--primary2));
+  color: white;
+}
+
+.bubble {
+  max-width: 76%;
+  padding: 14px 16px;
+  border-radius: 20px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  position: relative;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+}
+
+.assistant-bubble {
+  background: var(--assistant-bg);
+  border: 1px solid var(--assistant-border);
+  border-bottom-left-radius: 8px;
+}
+
+.user-bubble {
+  background: linear-gradient(135deg, var(--primary), var(--primary2));
+  color: white;
+  border-bottom-right-radius: 8px;
+}
+
+.assistant-bubble::before {
+  content: "";
+  position: absolute;
+  left: -7px;
+  bottom: 8px;
+  width: 14px;
+  height: 14px;
+  background: var(--assistant-bg);
+  border-left: 1px solid var(--assistant-border);
+  border-bottom: 1px solid var(--assistant-border);
+  transform: rotate(45deg);
+}
+
+.user-bubble::before {
+  content: "";
+  position: absolute;
+  right: -7px;
+  bottom: 8px;
+  width: 14px;
+  height: 14px;
+  background: #3b5bfa;
+  transform: rotate(45deg);
+}
+
+.composer {
+  padding: 16px;
+}
+
+textarea {
+  width: 100%;
+  min-height: 110px;
+  resize: vertical;
+  border-radius: 16px;
+  border: 1px solid #d8dee9;
+  padding: 12px 14px;
+  font-size: 14px;
+  background: rgba(255,255,255,0.96);
+}
+
+.actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.primary-btn, .ghost-btn {
+  border: none;
+  border-radius: 14px;
+  padding: 12px 18px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: transform 0.16s ease, opacity 0.16s ease;
+}
+
+.primary-btn {
+  background: linear-gradient(135deg, var(--primary), var(--primary2));
+  color: white;
+}
+
+===== FILE: vue_frontend/src/components/SettingsPanel.vue =====
+<template>
+  <aside class="sidebar panel enter-up delay-1">
+    <div class="brand">
+      <div class="icon">🩺</div>
+      <div>
+        <h2>Medical Chatbot</h2>
+        <p>Vue frontend for the coursework demo</p>
+      </div>
+    </div>
+
+    <div class="settings-window">
+      <div class="settings-tabs">
+        <button :class="['tab-btn', { active: activeTab === 'model' }]" @click="activeTab = 'model'">Model</button>
+        <button :class="['tab-btn', { active: activeTab === 'rag' }]" @click="activeTab = 'rag'">RAG</button>
+        <button :class="['tab-btn', { active: activeTab === 'docs' }]" @click="activeTab = 'docs'">Documents</button>
+      </div>
+
+      <div v-if="activeTab === 'model'" class="tab-panel">
+        <div class="section">
+          <label>Choose model</label>
+          <select :value="selectedModel" @change="$emit('update:selectedModel', $event.target.value)">
+            <option v-for="model in models" :key="model.key" :value="model.key">
+              {{ model.label }}
+            </option>
+          </select>
+        </div>
+
+        <div class="section">
+          <label>Generation Settings</label>
+
+          <div class="form-row">
+            <span>Max new tokens</span>
+            <span>{{ maxNewTokens }}</span>
+          </div>
+          <input :value="maxNewTokens" @input="$emit('update:maxNewTokens', Number($event.target.value))" type="range" min="128" max="640" step="32" />
+
+          <div class="form-row">
+            <span>Temperature</span>
+            <span>{{ Number(temperature).toFixed(2) }}</span>
+          </div>
+          <input :value="temperature" @input="$emit('update:temperature', Number($event.target.value))" type="range" min="0.1" max="1" step="0.05" />
+
+          <div class="form-row">
+            <span>Top-p</span>
+            <span>{{ Number(topP).toFixed(2) }}</span>
+          </div>
+          <input :value="topP" @input="$emit('update:topP', Number($event.target.value))" type="range" min="0.5" max="1" step="0.05" />
+        </div>
+      </div>
+
+      <div v-if="activeTab === 'rag'" class="tab-panel">
+        <div class="section">
+          <label>RAG Settings</label>
+
+          <div class="form-row">
+            <span>Top-k</span>
+            <span>{{ ragTopK }}</span>
+          </div>
+          <input :value="ragTopK" @input="$emit('update:ragTopK', Number($event.target.value))" type="range" min="1" max="8" step="1" />
+
+          <div class="form-row">
+            <span>Chunk size</span>
+            <span>{{ ragChunkSize }}</span>
+          </div>
+          <input :value="ragChunkSize" @input="$emit('update:ragChunkSize', Number($event.target.value))" type="range" min="300" max="1200" step="50" />
+
+          <div class="form-row">
+            <span>Chunk overlap</span>
+            <span>{{ ragOverlap }}</span>
+          </div>
+          <input :value="ragOverlap" @input="$emit('update:ragOverlap', Number($event.target.value))" type="range" min="0" max="300" step="20" />
+        </div>
+      </div>
+
+      <div v-if="activeTab === 'docs'" class="tab-panel">
+        <div class="section">
+          <label>Upload document</label>
+          <input type="file" @change="$emit('file-change', $event)" />
+          <p class="upload-hint">
+            Supported formats: TXT, MD, PDF, DOCX. Files are normalized into text chunks for retrieval.
+          </p>
+          <button class="primary-btn small-btn" @click="$emit('upload-file')" :disabled="!pendingFile || uploading">
+            {{ uploading ? 'Uploading...' : 'Upload File' }}
+          </button>
+        </div>
+
+        <div class="section">
+          <label>Available documents</label>
+          <div class="file-list">
+            <div v-for="f in uploadedFiles" :key="f.name" class="file-card">
+              <div class="file-left">
+                <input
+                  type="checkbox"
+                  :checked="selectedFiles.includes(f.name)"
+                  @change="$emit('toggle-file', f.name)"
+                />
+                <div class="file-info">
+                  <div class="file-name">{{ f.name }}</div>
+                  <div class="file-meta">{{ f.type.toUpperCase() }} · {{ f.size_kb }} KB</div>
+                </div>
+              </div>
+              <button class="danger-btn" @click="$emit('delete-file', f.name)">Delete</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>Example questions</label>
+      <button
+        v-for="q in exampleQuestions"
+        :key="q"
+        class="example-btn"
+        @click="$emit('pick-example', q)"
+      >
+        {{ q }}
+      </button>
+    </div>
+
+    <div class="notice">
+      <strong>Academic Use Only</strong>
+      <p>This demo is for coursework only and does not provide diagnosis or treatment advice.</p>
+    </div>
+  </aside>
+</template>
+
+<script setup>
+import { ref } from 'vue'
+
+const activeTab = ref('model')
+
+defineProps({
+  models: Array,
+  selectedModel: String,
+  maxNewTokens: Number,
+  temperature: Number,
+  topP: Number,
+  useRag: Boolean,
+  ragTopK: Number,
+  ragChunkSize: Number,
+  ragOverlap: Number,
+  uploadedFiles: Array,
+  selectedFiles: Array,
+  pendingFile: Object,
+  uploading: Boolean,
+  exampleQuestions: Array,
+})
+
+defineEmits([
+  'update:selectedModel',
+  'update:maxNewTokens',
+  'update:temperature',
+  'update:topP',
+  'update:useRag',
+  'update:ragTopK',
+  'update:ragChunkSize',
+  'update:ragOverlap',
+  'file-change',
+  'upload-file',
+  'toggle-file',
+  'delete-file',
+  'pick-example',
+])
+</script>
+
+<style scoped>
+.sidebar {
+  width: 360px;
+  border-radius: 24px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+}
+
+.brand {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #dbeafe, #e0e7ff);
+  font-size: 22px;
+}
+
+.brand h2 { margin: 0; }
+.brand p {
+  margin: 6px 0 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.settings-window {
+  background: rgba(255,255,255,0.7);
+  border: 1px solid rgba(255,255,255,0.5);
+  border-radius: 20px;
+  padding: 14px;
+  margin-bottom: 18px;
+}
+
+.settings-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.tab-btn {
+  flex: 1;
+  border: none;
+  border-radius: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  background: rgba(226,232,240,0.7);
+  font-weight: 600;
+}
+
+.tab-btn.active {
+  background: linear-gradient(135deg, var(--primary), var(--primary2));
+  color: white;
+}
+
+.section { margin-bottom: 18px; }
+
+.section label {
+  display: block;
+  margin-bottom: 10px;
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.toggle-row {
+  display: flex !important;
+  align-items: center;
+  gap: 10px;
+}
+
+.form-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--muted);
+  margin: 8px 0 4px;
+}
+
+select, input[type="range"], input[type="file"] {
+  width: 100%;
+}
+
+select {
+  border-radius: 16px;
+  border: 1px solid #d8dee9;
+  padding: 12px 14px;
+  font-size: 14px;
+  background: rgba(255,255,255,0.96);
+}
+
+.upload-hint {
+  margin: 8px 0 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.small-btn {
+  margin-top: 10px;
+  width: 100%;
+}
+
+.file-list {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.file-card {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(255,255,255,0.82);
+  border: 1px solid rgba(148,163,184,0.18);
+}
+
+.file-left {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  flex: 1;
+}
+
+.file-info {
+  min-width: 0;
+}
+
+.file-name {
+  font-size: 14px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.file-meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.example-btn {
+  width: 100%;
+  margin-bottom: 10px;
+
+===== FILE: vue_frontend/src/main.js =====
+import { createApp } from 'vue'
+import App from './App.vue'
+
+createApp(App).mount('#app')
+
+===== FILE: vue_frontend/vite.config.js =====
+import { fileURLToPath, URL } from 'node:url'
+
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+import vueDevTools from 'vite-plugin-vue-devtools'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [
+    vue(),
+    vueDevTools(),
+  ],
+  resolve: {
+    alias: {
+      '@': fileURLToPath(new URL('./src', import.meta.url))
+    },
+  },
+})
