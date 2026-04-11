@@ -1,0 +1,358 @@
+<template>
+  <aside class="sidebar panel enter-up delay-1">
+    <div class="brand">
+      <div class="icon">🩺</div>
+      <div>
+        <h2>Medical Chatbot</h2>
+        <p>Vue frontend for the coursework demo</p>
+      </div>
+    </div>
+
+    <div class="settings-window">
+      <div class="settings-tabs">
+        <button :class="['tab-btn', { active: activeTab === 'model' }]" @click="activeTab = 'model'">Model</button>
+        <button :class="['tab-btn', { active: activeTab === 'rag' }]" @click="activeTab = 'rag'">RAG</button>
+        <button :class="['tab-btn', { active: activeTab === 'docs' }]" @click="activeTab = 'docs'">Documents</button>
+      </div>
+
+      <div v-if="activeTab === 'model'" class="tab-panel">
+        <div class="section">
+          <label>Choose model</label>
+          <select :value="selectedModel" @change="$emit('update:selectedModel', $event.target.value)">
+            <option v-for="model in models" :key="model.key" :value="model.key">
+              {{ model.label }} ({{ model.key }})
+            </option>
+          </select>
+        </div>
+
+        <div class="section">
+          <label>Generation Settings</label>
+
+          <div class="form-row">
+            <span>Max new tokens</span>
+            <span>{{ maxNewTokens }}</span>
+          </div>
+          <input :value="maxNewTokens" @input="$emit('update:maxNewTokens', Number($event.target.value))" type="range" min="128" max="640" step="32" />
+
+          <div class="form-row">
+            <span>Temperature</span>
+            <span>{{ Number(temperature).toFixed(2) }}</span>
+          </div>
+          <input :value="temperature" @input="$emit('update:temperature', Number($event.target.value))" type="range" min="0.1" max="1" step="0.05" />
+
+          <div class="form-row">
+            <span>Top-p</span>
+            <span>{{ Number(topP).toFixed(2) }}</span>
+          </div>
+          <input :value="topP" @input="$emit('update:topP', Number($event.target.value))" type="range" min="0.5" max="1" step="0.05" />
+        </div>
+      </div>
+
+      <div v-if="activeTab === 'rag'" class="tab-panel">
+        <div class="section">
+          <label>RAG Settings</label>
+
+          <div class="form-row">
+            <span>Top-k</span>
+            <span>{{ ragTopK }}</span>
+          </div>
+          <input :value="ragTopK" @input="$emit('update:ragTopK', Number($event.target.value))" type="range" min="1" max="8" step="1" />
+
+          <div class="form-row">
+            <span>Chunk size</span>
+            <span>{{ ragChunkSize }}</span>
+          </div>
+          <input :value="ragChunkSize" @input="$emit('update:ragChunkSize', Number($event.target.value))" type="range" min="300" max="1200" step="50" />
+
+          <div class="form-row">
+            <span>Chunk overlap</span>
+            <span>{{ ragOverlap }}</span>
+          </div>
+          <input :value="ragOverlap" @input="$emit('update:ragOverlap', Number($event.target.value))" type="range" min="0" max="300" step="20" />
+        </div>
+      </div>
+
+      <div v-if="activeTab === 'docs'" class="tab-panel">
+        <div class="section">
+          <label>Upload document</label>
+          <input type="file" @change="$emit('file-change', $event)" />
+          <p class="upload-hint">
+            Supported formats: TXT, MD, PDF, DOCX. Files are normalized into text chunks for retrieval.
+          </p>
+          <button class="primary-btn small-btn" @click="$emit('upload-file')" :disabled="!pendingFile || uploading">
+            {{ uploading ? 'Uploading...' : 'Upload File' }}
+          </button>
+        </div>
+
+        <div class="section">
+          <label>Available documents</label>
+          <div class="file-list">
+            <div v-for="f in uploadedFiles" :key="f.name" class="file-card">
+              <div class="file-left">
+                <input
+                  type="checkbox"
+                  :checked="selectedFiles.includes(f.name)"
+                  @change="$emit('toggle-file', f.name)"
+                />
+                <div class="file-info">
+                  <div class="file-name">{{ f.name }}</div>
+                  <div class="file-meta">{{ f.type.toUpperCase() }} · {{ f.size_kb }} KB</div>
+                </div>
+              </div>
+              <button class="danger-btn" @click="$emit('delete-file', f.name)">Delete</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>Example questions</label>
+      <button
+        v-for="q in exampleQuestions"
+        :key="q"
+        class="example-btn"
+        @click="$emit('pick-example', q)"
+      >
+        {{ q }}
+      </button>
+    </div>
+
+    <div class="notice">
+      <strong>Academic Use Only</strong>
+      <p>This demo is for coursework only and does not provide diagnosis or treatment advice.</p>
+    </div>
+  </aside>
+</template>
+
+<script setup>
+import { ref } from 'vue'
+
+const activeTab = ref('model')
+
+defineProps({
+  models: Array,
+  selectedModel: String,
+  maxNewTokens: Number,
+  temperature: Number,
+  topP: Number,
+  useRag: Boolean,
+  ragTopK: Number,
+  ragChunkSize: Number,
+  ragOverlap: Number,
+  uploadedFiles: Array,
+  selectedFiles: Array,
+  pendingFile: Object,
+  uploading: Boolean,
+  exampleQuestions: Array,
+})
+
+defineEmits([
+  'update:selectedModel',
+  'update:maxNewTokens',
+  'update:temperature',
+  'update:topP',
+  'update:useRag',
+  'update:ragTopK',
+  'update:ragChunkSize',
+  'update:ragOverlap',
+  'file-change',
+  'upload-file',
+  'toggle-file',
+  'delete-file',
+  'pick-example',
+])
+</script>
+
+<style scoped>
+.sidebar {
+  width: 360px;
+  border-radius: 24px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+}
+
+.brand {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #dbeafe, #e0e7ff);
+  font-size: 22px;
+}
+
+.brand h2 { margin: 0; }
+.brand p {
+  margin: 6px 0 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.settings-window {
+  background: rgba(255,255,255,0.7);
+  border: 1px solid rgba(255,255,255,0.5);
+  border-radius: 20px;
+  padding: 14px;
+  margin-bottom: 18px;
+}
+
+.settings-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.tab-btn {
+  flex: 1;
+  border: none;
+  border-radius: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  background: rgba(226,232,240,0.7);
+  font-weight: 600;
+}
+
+.tab-btn.active {
+  background: linear-gradient(135deg, var(--primary), var(--primary2));
+  color: white;
+}
+
+.section { margin-bottom: 18px; }
+
+.section label {
+  display: block;
+  margin-bottom: 10px;
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.toggle-row {
+  display: flex !important;
+  align-items: center;
+  gap: 10px;
+}
+
+.form-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--muted);
+  margin: 8px 0 4px;
+}
+
+select, input[type="range"], input[type="file"] {
+  width: 100%;
+}
+
+select {
+  border-radius: 16px;
+  border: 1px solid #d8dee9;
+  padding: 12px 14px;
+  font-size: 14px;
+  background: rgba(255,255,255,0.96);
+}
+
+.upload-hint {
+  margin: 8px 0 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.small-btn {
+  margin-top: 10px;
+  width: 100%;
+}
+
+.file-list {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.file-card {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(255,255,255,0.82);
+  border: 1px solid rgba(148,163,184,0.18);
+}
+
+.file-left {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  flex: 1;
+}
+
+.file-info {
+  min-width: 0;
+}
+
+.file-name {
+  font-size: 14px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.file-meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.example-btn {
+  width: 100%;
+  margin-bottom: 10px;
+  text-align: left;
+  border: 1px solid rgba(99,102,241,0.12);
+  background: rgba(238,242,255,0.9);
+  padding: 11px 13px;
+  border-radius: 14px;
+  cursor: pointer;
+}
+
+.notice {
+  margin-top: auto;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(255,247,237,0.95);
+  border: 1px solid rgba(253,186,116,0.5);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.notice p { margin-bottom: 0; }
+
+.primary-btn, .danger-btn {
+  border: none;
+  border-radius: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.primary-btn {
+  background: linear-gradient(135deg, var(--primary), var(--primary2));
+  color: white;
+}
+
+.danger-btn {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+</style>
